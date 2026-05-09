@@ -1,0 +1,544 @@
+clc; clear all;  
+
+%% 1. 配置与编译 (自动 OpenMP 支持)
+n1 = 7; %n1边形
+fangxiang = -1; %1为同向，-1为异向
+
+cpp_file = 'gluings_fast_mex.cpp';
+mex_file = ['gluings_fast_mex.', mexext];
+
+% 编译逻辑：自动添加 OpenMP 标志
+if ~exist(mex_file, 'file') || dir(cpp_file).datenum > dir(mex_file).datenum
+    disp('正在编译支持 OpenMP 的 C++ 加速模块...');
+
+    % 检测编译器类型以设置 Flag
+    cc = mex.getCompilerConfigurations('C++', 'Selected');
+    if isempty(cc)
+        error('未找到 C++ 编译器，请运行 mex -setup');
+    end
+
+    omp_flags = '';
+    if contains(cc.Name, 'Visual') % Visual Studio
+        omp_flags = 'COMPFLAGS="$COMPFLAGS /openmp"';
+    elseif contains(cc.Name, 'MinGW') || contains(cc.Name, 'GNU') % GCC/MinGW
+        omp_flags = 'CXXFLAGS="$CXXFLAGS -fopenmp" LDFLAGS="$LDFLAGS -fopenmp"';
+    end
+
+    compile_cmd = sprintf('mex %s -R2018a %s', omp_flags, cpp_file);
+    fprintf('编译命令: %s\n', compile_cmd);
+
+    try
+        eval(compile_cmd);
+        disp('编译成功！');
+    catch ME
+        error('编译失败: %s', ME.message);
+    end
+end
+
+%% 2. 准备基础数据
+g = 2;            
+n2 = n1 - 2 * g;  
+
+% 生成 AVC
+AVC = integer_partitions(2 * n1, n2, 3);
+AVC_sorted = cellfun(@(x) sort(x), AVC, 'UniformOutput', false);
+
+max_len = max(cellfun(@length, AVC_sorted));
+AVC_mat = zeros(length(AVC_sorted), max_len);
+for k = 1:length(AVC_sorted)
+    AVC_mat(k, 1:length(AVC_sorted{k})) = AVC_sorted{k};
+end
+
+% 生成候选边
+sets = 0 : 2*n1-1; 
+all_pairs = nchoosek(sets, 2);
+valid_pairs = [];
+for k = 1:size(all_pairs, 1)
+    u = all_pairs(k, 1);
+    v = all_pairs(k, 2);
+    is_adj = false;
+    if (u < n1 && v < n1)
+        if abs(u-v) == 1 || (min(u,v)==0 && max(u,v)==n1-1), is_adj = true; end
+    elseif (u >= n1 && v >= n1)
+        if abs(u-v) == 1 || (min(u,v)==n1 && max(u,v)==2*n1-1), is_adj = true; end
+    end
+    if ~is_adj
+        valid_pairs = [valid_pairs; u, v];
+    end
+end
+candidates_int32 = int32(valid_pairs); 
+
+%% 3. 生成 Depth-2 种子 (批量生成)
+fprintf('正在生成种子任务 (n1=%d)...\n', n1);
+
+% Row 1 固定 u=0 以打破对称性。
+row1_candidates = valid_pairs(valid_pairs(:,1)==0 & valid_pairs(:,2)>=n1, :);
+% Row 2 u > 0
+row2_candidates = valid_pairs(valid_pairs(:,1)>0, :);
+
+seed_list_cell = cell(size(row1_candidates,1), 1);
+
+for i = 1:size(row1_candidates, 1)
+    r1 = row1_candidates(i, :);
+
+    % 快速筛选不冲突的 r2
+    conflict_mask = (row2_candidates(:,1) == r1(1) | row2_candidates(:,1) == r1(2) | ...
+                     row2_candidates(:,2) == r1(1) | row2_candidates(:,2) == r1(2));
+
+    valid_r2 = row2_candidates(~conflict_mask, :);
+
+    n_valid = size(valid_r2, 1);
+    if n_valid > 0
+        block = zeros(n_valid, 4, 'int32');
+        block(:, 1) = r1(1);
+        block(:, 2) = r1(2);
+        block(:, 3:4) = valid_r2;
+        seed_list_cell{i} = block;
+    end
+end
+
+Seeds = vertcat(seed_list_cell{:});
+num_seeds = size(Seeds, 1);
+fprintf('总任务数 (Seeds): %d\n', num_seeds);
+
+if num_seeds == 0
+    disp('无合法种子。');
+    return;
+end
+
+%% 4. C++ OpenMP 并行搜索 (含去重)
+fprintf('启动 C++ 并行搜索 (OpenMP + 内部去重)...\n');
+tic;
+
+results_matrix = gluings_fast_mex(Seeds, candidates_int32, n1, fangxiang, AVC_mat);
+
+time_elapsed = toc;
+fprintf('搜索与去重完成，总耗时: %.4f 秒\n', time_elapsed);
+
+if isempty(results_matrix)
+    disp('未找到解。');
+else
+    num_sols = size(results_matrix, 1) / n1;
+    fprintf('找到唯一解个数: %d\n', num_sols);
+    
+    % 可选：展示前几个解
+    disp('前 1 个解示例:');
+    disp(results_matrix(1:n1, :));
+end
+
+
+Unique_Solutions = cell(num_sols, 1);
+    for s = 0:num_sols-1
+        Unique_Solutions{s+1} = double(results_matrix(s*n1+1 : (s+1)*n1, :));
+    end
+%% 0. 启动并行池 (如果尚未启动)
+if isempty(gcp('nocreate'))
+    parpool; % 根据你的 CPU 核心数自动启动
+end
+
+%% 1. 并行筛查 (AVC判断)
+% 预分配 boolean 数组，避免动态增加 cell 大小带来的巨大开销
+num_total = length(Unique_Solutions);
+keep_mask = false(num_total, 1); % 标记是否保留
+error_mask = false(num_total, 1); % 标记是否出错
+
+fprintf('正在并行筛查 %d 个解...\n', num_total);
+
+tic;
+parfor i = 1:num_total
+    % 注意：parfor 中不能直接访问全局变量，必须传递参数
+    % 假设 get_vertex_cycles 和 AVCjie 是独立函数文件
+    C = get_vertex_cycles(Unique_Solutions{i}, n1, fangxiang);
+    
+    % 执行判断
+    avc_val = AVCjie(C, n1); 
+    
+    if avc_val ~= 1 && avc_val ~= -2
+        % 记录错误索引 (并行中不能直接 print，先记录)
+        error_mask(i) = true;
+    end
+    
+    if avc_val ~= -2
+        keep_mask(i) = true;
+    end
+end
+
+% 处理报错信息
+error_indices = find(error_mask);
+if ~isempty(error_indices)
+    fprintf('警告：以下索引的 AVCjie 格式异常: %s\n', mat2str(error_indices'));
+end
+
+% 一次性提取有效解
+youjie1 = Unique_Solutions(keep_mask);
+fprintf('筛查完成，剩余有效解: %d (耗时: %.4f 秒)\n', length(youjie1), toc);
+
+%% 2. 并行分类 (边分类)
+% 逻辑优化：不要对外层循环 j 进行遍历，而是对每个解计算一次类别数，然后统计
+num_valid = length(youjie1);
+edge_counts = zeros(num_valid, 1);
+
+fprintf('正在并行计算边分类...\n');
+tic;
+
+parfor i = 1:num_valid
+    % 对每个解只计算一次，而不是计算 n1 次
+    classes = get_edge_classes(youjie1{i}(:, 1:2), n1);
+    edge_counts(i) = length(classes);
+end
+
+time_calc = toc;
+fprintf('分类计算完成 (耗时: %.4f 秒)\n', time_calc);
+
+%% 3. 统计结果输出
+% 这一步极快，串行即可
+grouped_results = cell(n1, 1);
+
+fprintf('=== 统计结果 ===\n');
+for j = 1:n1
+    % 利用逻辑索引瞬间提取，不需要再重新计算 get_edge_classes
+    current_group = youjie1(edge_counts == j);
+    grouped_results{j} = current_group;
+    
+    % 输出你需要的长度
+    fprintf('边分类数为 %d 的解个数: %d\n', j, length(current_group));
+end
+
+
+
+
+ %有些角度为0,筛查
+youjie={};
+wujie=[];
+for i1=1:length(Unique_Solutions)
+    C=get_vertex_cycles(Unique_Solutions{i1},n1,fangxiang);
+    if check_subset_inclusion(C,n1)
+        wujie=[wujie,i1];
+    else
+        youjie{end+1}=Unique_Solutions{i1};
+    end
+end
+
+
+
+%有些角度为0,筛查
+youjie1={};
+wujie=[];
+zhongzhi=[];
+for i1=1:length(youjie)
+    C=get_vertex_cycles(youjie{i1},n1,fangxiang);
+    AVC=AVCjie(C,n1);%增加了新的剪枝条件，有的没有正数解
+    if AVC~=1&&AVC~=-2
+        printf('检查AVCjie格式！');
+        zhongzhi=[zhongzhi,i1];
+    end
+    if AVC==-2%||check_subset_inclusion(C,n1)
+        wujie=[wujie,i1];
+    else
+        youjie1{end+1}=youjie{i1};
+    end
+end
+
+
+
+% for j=1:n1
+%不同边个数判断
+edge={}; 
+for i=1:length(youjie1)
+    %和zhuibian一样
+   if length(get_edge_classes(youjie1{i}(:,1:2),n1))==6
+       edge{end+1}=youjie1{i};
+   end
+end
+length(edge)
+% end
+
+
+% %% ================= 辅助函数 (完整恢复) =================
+function p = integer_partitions(n, k, min_val)
+    if nargin < 3, min_val = 1; end
+    if k == 0
+        if n == 0, p = {[]}; else, p = {}; end
+        return;
+    end
+    if n < k * min_val
+        p = {};
+        return;
+    end
+    p = {};
+    for i = min_val : floor(n / k)
+        sub_partitions = integer_partitions(n - i, k - 1, i);
+        for j = 1:length(sub_partitions)
+            p{end+1} = [i, sub_partitions{j}];
+        end
+    end
+end
+
+
+function vertex_cells = get_vertex_cycles(A, n1, fangxiang)
+% GET_VERTEX_CYCLES 根据矩阵A和粘合方向计算顶点情况（保留连接顺序）
+% 输入:
+%   A: 粘合矩阵 (n1 x 2)
+%   n1: 边数参数
+%   fangxiang: 1 (同向/可定向) 或 -1 (反向/不可定向)
+% 输出:
+%   vertex_cells: Cell数组，每个单元包含构成该顶点的所有角点编号，且按连接顺序排列
+
+    % 角点总数 (0 到 2*n1 - 1)
+    num_corners = 2 * n1;
+
+    % --- 1. 构建邻接表 (Adjacency List) ---
+    % 使用 cell 数组存储图，adj{i} 存储与角点 i 相连的邻居
+    % 索引使用 MATLAB 的 1-based，所以存取时要注意 +1
+    adj = cell(num_corners, 1);
+
+    % 内部函数: 添加无向边
+    function add_edge(u, v)
+        % u, v 为 0-based 索引
+        idx_u = u + 1;
+        idx_v = v + 1;
+        adj{idx_u} = [adj{idx_u}, v];
+        adj{idx_v} = [adj{idx_v}, u];
+    end
+
+    % 内部函数: 获取下一个角点 (处理周期性边界)
+    function next_idx = get_next_corner(curr_idx)
+        if curr_idx < n1 % 块1 (0 ~ n1-1)
+            next_idx = mod(curr_idx + 1, n1);
+        else % 块2 (n1 ~ 2n1-1)
+            next_idx = n1 + mod(curr_idx - n1 + 1, n1);
+        end
+    end
+
+    % --- 2. 填充图的连接关系 (核心逻辑修改) ---
+    for i = 1:size(A, 1)
+        m = A(i, 1);
+        n = A(i, 2);
+
+        m_next = get_next_corner(m);
+        n_next = get_next_corner(n);
+        
+        % 判断是否在同一个多边形块内
+        is_same_block = (m < n1 && n < n1) || (m >= n1 && n >= n1);
+
+        if fangxiang == 1
+            % 同向 (可定向): 始终是交叉粘合
+            % 规则: m后继 <-> n,  m <-> n后继
+            add_edge(m_next, n);
+            add_edge(m, n_next);
+            
+        elseif fangxiang == -1
+            % 反向 (不可定向): 取决于是否跨块
+            if is_same_block
+                % 同块内反向: 交叉粘合 (Cross Gluing)
+                % 对应: [m+1, n] 和 [m, n+1]
+                add_edge(m_next, n);
+                add_edge(m, n_next);
+            else
+                % 异块间反向: 平行粘合 (Parallel Gluing)
+                % 对应: [m, n] 和 [m+1, n+1]
+                add_edge(m, n);
+                add_edge(m_next, n_next);
+            end
+        end
+    end
+
+    % --- 3. 遍历图寻找回路 (串联起来) ---
+    vertex_cells = {};
+    visited = false(num_corners, 1); % 记录已访问的角点 (1-based)
+
+    for i = 0 : num_corners - 1
+        idx = i + 1;
+        if ~visited(idx)
+            % 发现新顶点，开始追踪回路
+            cycle = [];
+            curr = i;
+            prev = -1; % 用于防止掉头回走
+            
+            while ~visited(curr + 1)
+                visited(curr + 1) = true;
+                cycle = [cycle, curr];
+                
+                % 找下一个未访问的邻居，或者回到起点的邻居
+                neighbors = adj{curr + 1};
+                found_next = false;
+                
+                for k = 1:length(neighbors)
+                    nb = neighbors(k);
+                    % 核心逻辑: 只要不是刚走过来的那个点(prev)，就是下一个点
+                    if nb ~= prev
+                        prev = curr;
+                        curr = nb;
+                        found_next = true;
+                        break;
+                    end
+                end
+                
+                % 正常情况下闭曲面粘合必定闭合，且度数为2，这里作为安全出口
+                if ~found_next
+                    break;
+                end
+                
+                % 如果回到了起点 (回路闭合)，停止
+                if curr == i
+                    break;
+                end
+            end
+            
+            vertex_cells{end+1} = cycle;
+        end
+    end
+end
+
+function exitflag=AVCjie(C,n1)%判断AVC是否存在一个正数解
+   C_mod=cellfun(@(v) mod(v, n1), C, 'UniformOutput', false);
+   num_eq = length(C_mod); % 方程数量 (行数)
+num_vars = n1;          % 变量数量 (x0 到 x6，共7个变量)
+target_sum = 2;
+% 初始化稀疏矩阵 A (也可以用 zeros)
+A = zeros(num_eq, num_vars);
+b = ones(num_eq, 1) * target_sum; % 右边都是 2
+
+for i = 1:num_eq
+    indices = C_mod{i};
+    % 注意：题目中是 x0, x1... (0-based)，但 MATLAB 矩阵索引从 1 开始
+    % 所以 x0 对应矩阵的第 1 列，x1 对应第 2 列，以此类推。
+    col_indices = indices + 1; 
+    
+    % 填充矩阵 A
+    % 如果一个方程中同一个变量出现多次（比如 mod 后有两个 0），系数会累加
+    for k = col_indices
+        A(i, k) = A(i, k) + 1;
+    end
+end
+% 
+% disp('系数矩阵 A:');
+% disp(A);
+% disp('右端向量 b:');
+% disp(b);
+
+% ---------------------------------------------------------
+% 步骤 3: 判断是否存在正数解 (x > 0)
+% ---------------------------------------------------------
+% 这是一个线性规划的可行性问题。
+% 我们寻找 x 使得 Ax = b 且 x > 0。
+% 标准求解器 linprog 处理的是 Ax = b, x >= lb。
+% 为了表示"正数"(严格大于0)，我们将下界 lb 设为一个极小的正数 (例如 1e-6)。
+
+lb = ones(num_vars, 1) * 1e-6; % 下界：x >= 0.000001
+ub = [];                       % 上界：无无穷大
+f = zeros(num_vars, 1);        % 目标函数：我们只关心可行性，设为0即可
+
+% 求解线性规划
+options = optimoptions('linprog', 'Display', 'off');
+[x_sol, fval, exitflag] = linprog(f, [], [], A, b, lb, ub, options);
+
+function edge_chains = get_edge_classes(A, n1)
+% GET_EDGE_CLASSES 计算矩阵A mod n1 后的连通情况
+% 输入:
+%   A: 粘合矩阵
+%   n1: 模数
+% 输出:
+%   edge_chains: Cell数组，每组包含串联起来的边索引(0 到 n1-1)
+
+    % 1. 对矩阵取模
+    A_mod = mod(A, n1);
+    
+    % 2. 初始化并查集
+    % 范围是 0 到 n1-1，共 n1 个元素
+    parent = 1:n1; 
+    
+    % --- 内部函数: 查找根节点 ---
+    function p = find_set(x)
+        path = [];
+        while parent(x) ~= x
+            path(end+1) = x;
+            x = parent(x);
+        end
+        for node = path, parent(node) = x; end
+        p = x;
+    end
+
+    % --- 内部函数: 合并集合 ---
+    function union_set(x, y)
+        rootX = find_set(x);
+        rootY = find_set(y);
+        if rootX ~= rootY
+            parent(rootY) = rootX; % 合并
+        end
+    end
+
+    % 3. 遍历每一行进行串联
+    for i = 1:size(A_mod, 1)
+        u = A_mod(i, 1);
+        v = A_mod(i, 2);
+        
+        % 转为 1-based 索引进行操作
+        union_set(u + 1, v + 1);
+    end
+    
+    % 4. 整理结果 (Grouping)
+    % 计算最终的根节点状态
+    final_roots = arrayfun(@(x) find_set(x), 1:n1);
+    unique_roots = unique(final_roots);
+    
+    % 仅输出包含元素的集合（理论上所有 0~n1-1 都在某个集合中）
+    edge_chains = {};
+    for k = 1:length(unique_roots)
+        r = unique_roots(k);
+        % 找出属于该组的所有边，转回 0-based
+        members = find(final_roots == r) - 1;
+        % 排序以便查看
+        edge_chains{end+1} = sort(members);
+    end
+end
+
+function [is_invalid, error_msg] = check_subset_inclusion(Cycle_Cells, n1)
+% CHECK_SUBSET_INCLUSION (MOD N1 版本)
+% 1. 将所有顶点对 n1 取模。
+% 2. 检查是否存在 Cycle A 的变量集合 包含 Cycle B 的变量集合。
+%    如果包含，且有剩余（真子集），则剩余部分之和必须为0，导致矛盾。
+
+    num_cycles = length(Cycle_Cells);
+    % 【修改点1】变量数现在只有 n1 个，不再是 2*n1
+    num_vars = n1; 
+    
+    % 1. 构建计数矩阵 M (行=循环，列=模n1后的顶点出现次数)
+    M = zeros(num_cycles, num_vars);
+    for i = 1:num_cycles
+        raw_data = Cycle_Cells{i};
+        
+        % 【修改点2】先对 n1 取模，结果为 0 ~ n1-1
+        data_mod = mod(raw_data, n1);
+        
+        % 转为 1-based索引用于累加 (1 ~ n1)
+        idx = data_mod + 1;
+        
+        % 统计每个 mod 后顶点的出现次数
+        M(i, :) = accumarray(idx(:), 1, [num_vars, 1])';
+    end
+    
+    is_invalid = false;
+    error_msg = '';
+
+    % 2. 暴力两两比较
+    for i = 1:num_cycles       % "大"循环候选
+        for j = 1:num_cycles   % "小"循环候选
+            if i == j, continue; end 
+            
+            % 计算差值向量
+            diff_vec = M(i, :) - M(j, :);
+            
+            % 判断逻辑：
+            % 1. diff_vec >= 0: i 包含了 j 所有的变量
+            % 2. any(diff_vec > 0): i 比 j 多出了至少一个变量 (真子集)
+            if all(diff_vec >= 0) && any(diff_vec > 0)
+                is_invalid = true;
+                error_msg = sprintf('发现矛盾(Mod %d): Cycle %d 包含了 Cycle %d。', n1, i, j);
+                return;
+            end
+        end
+    end
+end
+ 
+
