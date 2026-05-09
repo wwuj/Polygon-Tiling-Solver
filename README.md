@@ -1,7 +1,7 @@
 # Polygon-Tiling-Solver
 ## 📌 About This Project
 This project aims to explore and compute the topological and geometric properties of polygon edge-to-edge tilings. Specifically, the program enumerates and verifies all possible edge and angle configurations for the following scenarios:
-1. **Single $n$-gon**: Forming an orientable surface of genus $g$, or a non-orientable surface of genus $k$.
+1. **Single $n$-gon**: Forming an orientable surface of genus $g$, or a non-orientable surface of genus $k$ under edge-to-edge tessellation.
 2. **Two congruent $n$-gons**: Forming an orientable surface of genus $g$, or a non-orientable surface of genus $k$ under edge-to-edge tessellation.
 
 **Algorithmic Constraints:**
