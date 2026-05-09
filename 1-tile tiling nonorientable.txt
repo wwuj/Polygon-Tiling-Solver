@@ -1,0 +1,250 @@
+clc;
+clear all;
+close all;
+
+% clear mex
+% mex feidingxiang_mex.cpp
+% === 参数设置 ===
+n1 = 8;%n1边形
+g = 3;%亏格g的不可定向曲面
+% 【修改】n2 公式更新
+n2 = 1 - g + n1/2;
+daxiao = n1/2;
+fprintf('===== 参数配置 =====\n');
+fprintf('n1=%d, g=%d, n2=%d, daxiao=%d\n', n1, g, n2, daxiao);
+fprintf('====================\n\n');
+
+% === 生成带有类型的 Pairs ===
+sets = 0:n1-1;
+base_pairs = nchoosek(sets, 2);
+is_adjacent_mask = (base_pairs(:,2) - base_pairs(:,1) == 1) | ...
+                   (base_pairs(:,1) == 0 & base_pairs(:,2) == n1-1);
+
+base_pairs_non_adjacent = base_pairs(~is_adjacent_mask, :);
+pairs0 = [base_pairs_non_adjacent, zeros(size(base_pairs_non_adjacent,1), 1)];
+pairs1 = [base_pairs, ones(size(base_pairs,1), 1)];
+pairs = [pairs0; pairs1];
+
+% 4. 按行排序以保持确定性 (u, v, type)
+pairs = sortrows(pairs, [1, 2, 3]);
+
+fprintf('生成了 %d 个带有类型的候选边组合。\n', size(pairs, 1));
+
+
+% === 计算有效的整数划分组合 ===
+disp('正在计算有效的分区大小组合以进行高级剪枝...');
+min_group_size = 3; 
+valid_partitions_cell = integer_partitions(n1, n2, min_group_size);
+if isempty(valid_partitions_cell)
+    error('对于 n1=%d, n2=%d, min_size=%d，不存在有效的整数划分。', n1, n2, min_group_size);
+end
+valid_partitions_matrix = vertcat(valid_partitions_cell{:});
+valid_partitions_matrix = sort(valid_partitions_matrix, 2);
+fprintf('找到了 %d 种有效的整数划分组合。\n', size(valid_partitions_matrix, 1));
+
+% === 阶段一：预处理，生成初始边 ===
+tic;
+disp('阶段一：正在生成唯一的2-边初始集...');
+local_map = containers.Map('KeyType', 'char', 'ValueType', 'logical');
+first_edges_list = {}; 
+
+% 只有当边数 > 1 时才需要进行两两组合检查，这里假设 daxiao >= 2
+for i = 1:size(pairs,1)
+    edge1 = pairs(i, :); % [u, v, type]
+    
+    % 找出与 edge1 节点冲突的边 (共享端点)
+    % 比较前两列即可
+    is_node_conflict = (pairs(:,1) == edge1(1) | pairs(:,1) == edge1(2) | ...
+                        pairs(:,2) == edge1(1) | pairs(:,2) == edge1(2));
+    
+    % 【修改】根据 Type 计算特定的矛盾边
+    u = edge1(1); v = edge1(2); type = edge1(3);
+    
+    if type == 0
+        % Type 0: 矛盾边为 mod([u-1, v+1, 0]) 和 mod([u+1, v-1, 0])
+        u_m1 = mod(u - 1, n1); v_p1 = mod(v + 1, n1);
+        u_p1 = mod(u + 1, n1); v_m1 = mod(v - 1, n1);
+        
+        f1 = sort([u_m1, v_p1]); f1 = [f1, 0];
+        f2 = sort([u_p1, v_m1]); f2 = [f2, 0];
+    else
+        % Type 1: 矛盾边为 mod([u-1, v-1, 1]) 和 mod([u+1, v+1, 1])
+        u_m1 = mod(u - 1, n1); v_m1 = mod(v - 1, n1);
+        u_p1 = mod(u + 1, n1); v_p1 = mod(v + 1, n1);
+        
+        f1 = sort([u_m1, v_m1]); f1 = [f1, 1];
+        f2 = sort([u_p1, v_p1]); f2 = [f2, 1];
+    end
+    
+    % 筛选剩余可用的对
+    % 1. 移除节点冲突
+    % 2. 移除特定的矛盾边
+    mask_keep = ~is_node_conflict & ...
+                ~(pairs(:,1)==f1(1) & pairs(:,2)==f1(2) & pairs(:,3)==f1(3)) & ...
+                ~(pairs(:,1)==f2(1) & pairs(:,2)==f2(2) & pairs(:,3)==f2(3));
+            
+    remaining_pairs = pairs(mask_keep, :);
+
+    % 几何交叉检查 (无论 Type 如何，几何上交叉通常也是需要考虑剪枝的，
+    % 但如果题目要求只考虑上述矛盾边逻辑，可注释掉下面这段。
+    % 通常为了效率和拓扑有效性，保留几何交叉检查是合理的，
+    % 这里假设不同Type在同一位置也遵循一般的几何不交叉原则)
+    % 为简化，此处严格遵循题目描述的“矛盾边”逻辑，暂不添加额外的几何交叉过滤，
+    % 依靠 C++ 中的 forbidden_set 和 used_nodes 控制。
+    
+    if size(remaining_pairs, 1) < daxiao - 1
+        continue;
+    end
+
+    for j = 1:size(remaining_pairs, 1)
+        edge2 = remaining_pairs(j, :);
+        % 简单的顺序约束，避免 (e1, e2) 和 (e2, e1) 重复
+        if edge2(1) < edge1(1), continue; end
+        
+        initial_set = [edge1; edge2];
+
+        % 规范化处理 (现在处理 3 列数据)
+        candidate_edges = feidingxiang_mex('pingfan', initial_set, n1);
+        key_str = feidingxiang_mex('hash', candidate_edges);
+
+        if ~isKey(local_map, key_str)
+            local_map(key_str) = true;
+            first_edges_list{end+1} = candidate_edges;
+        end
+    end
+end
+
+if isempty(first_edges_list)
+    error('阶段一未生成任何有效初始集，请检查参数或约束。');
+end
+
+first_edges = vertcat(first_edges_list{:});
+fprintf('阶段一完成，生成了 %d 个唯一的2-边初始集。\n', size(first_edges, 1) / 2);
+toc;
+
+%% === 阶段二：优化的动态并行计算 ===
+tic;
+disp('正在启动优化的并行池...');
+if ~isempty(gcp('nocreate'))
+    delete(gcp('nocreate'));
+end
+p = parpool(); 
+fprintf('正在将常量数据预加载到 %d 个 worker 中...\n', p.NumWorkers);
+
+const_pairs = parallel.pool.Constant(pairs);
+const_valid_partitions = parallel.pool.Constant(valid_partitions_matrix);
+fprintf('数据预加载完成。\n');
+
+INITIAL_SET_SIZE = 2; 
+total_tasks = size(first_edges, 1) / INITIAL_SET_SIZE;
+fprintf('总共 %d 个独立任务将被动态分配。\n', total_tasks);
+
+F(total_tasks) = parallel.FevalFuture;
+results_all = cell(1, total_tasks);
+
+fprintf('开始异步提交任务...\n');
+for k = 1:total_tasks
+    start_idx = (k - 1) * INITIAL_SET_SIZE + 1;
+    end_idx = k * INITIAL_SET_SIZE;
+    e_task = first_edges(start_idx:end_idx, :);
+
+    F(k) = parfeval(p, @processSingleTask, 1, ...
+                    e_task, const_pairs, n1, n2, daxiao, ...
+                    const_valid_partitions);
+end
+
+% === 监控与结果收集 ===
+completed_count = 0;
+progress_timer = tic;
+
+for k = 1:total_tasks
+    try
+        [completed_idx, task_result] = fetchNext(F);
+        results_all{completed_idx} = task_result;
+        completed_count = completed_count + 1;
+
+        if toc(progress_timer) >= 20
+            fprintf('进度: %d / %d 个任务已完成。\n', completed_count, total_tasks);
+            progress_timer = tic;
+        end
+    catch ME
+        fprintf('任务错误: %s\n', ME.message);
+    end
+end
+fprintf('所有任务处理完毕！最终进度: %d / %d。\n', completed_count, total_tasks);
+toc;
+
+%% === 阶段三：主进程合并 + 全局去重 ===
+disp('阶段三：正在合并结果并进行全局去重...');
+successful_results_indices = cellfun(@(c) iscell(c) && ~isempty(c), results_all);
+results_all_filtered = results_all(successful_results_indices);
+
+if isempty(results_all_filtered)
+    all_results = {};
+else
+    all_results = vertcat(results_all_filtered{:});
+end
+fprintf('并行阶段共生成 %d 个有效候选解（含重复）\n', length(all_results));
+
+global_map = containers.Map('KeyType','char','ValueType','logical');
+unique_results = {};
+
+if ~isempty(all_results)
+    for i = 1:length(all_results)
+        edges = all_results{i};
+        % 规范化
+        canonical_edges = feidingxiang_mex('pingfan', edges, n1);
+        key_str = feidingxiang_mex('hash', canonical_edges);
+
+        if ~isKey(global_map, key_str)
+            global_map(key_str) = true;
+            unique_results{end+1} = canonical_edges;
+        end
+    end
+end
+fprintf('去重后剩余 %d 个唯一结构\n', length(unique_results));
+%disp('前3个结果示例：');
+% for i = 1:min(11, length(unique_results))
+%     disp(unique_results{i});
+% end
+%fprintf('脚本执行完毕。\n');
+
+% =========================================================================
+%           Worker 并行任务函数
+% =========================================================================
+function taskResult = processSingleTask(e_task, const_pairs, n1, n2, daxiao, const_valid_partitions)
+    pairs_local = const_pairs.Value;
+    valid_partitions_local = const_valid_partitions.Value;
+    try
+        taskResult = feidingxiang_mex('build', ...
+            e_task, ...
+            pairs_local, ...
+            n1, n2, daxiao,  ...
+            valid_partitions_local);
+    catch ME
+        fprintf('Worker error: %s\n', ME.message);
+        taskResult = {};
+    end
+end
+
+% =========================================================================
+%                         整数划分辅助函数
+% =========================================================================
+function p = integer_partitions(n, k, min_val)
+    if nargin < 3, min_val = 1; end
+    if k == 0
+        if n == 0, p = {[]}; else, p = {}; end
+        return;
+    end
+    if n < k * min_val
+        p = {};
+        return;
+    end
+    p = {};
+    for i = min_val : floor(n / k)
+        sub_partitions = integer_partitions(n - i, k - 1, i);
+        for j = 1:length(sub_partitions)
+            p{end+1} = [i, sub_partitions{j}];
+        end
+    end
+end

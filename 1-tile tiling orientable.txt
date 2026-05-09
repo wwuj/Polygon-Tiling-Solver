@@ -1,0 +1,202 @@
+clc;%n1边形，亏格为g的定向曲面
+clear all;
+close all;
+
+% === 参数设置 ===
+n1 = 8;
+g = 2;
+n2 = 1 - 2*g + n1/2;
+daxiao = n1/2;
+fprintf('===== 参数配置 =====\n');
+fprintf('n1=%d, g=%d, n2=%d, daxiao=%d\n', n1, g, n2, daxiao);
+fprintf('====================\n\n');
+
+sets = 0:n1-1;
+pairs = nchoosek(sets,2);
+% 移除与外圈相邻或重合的边
+invalid_mask = (pairs(:,2) - pairs(:,1) == 1) | (pairs(:,1) == 0 & pairs(:,2) == n1-1);
+pairs(invalid_mask, :) = [];
+
+% === 计算有效的整数划分组合 ===
+disp('正在计算有效的分区大小组合以进行高级剪枝...');
+min_group_size = 3; % 每个连通分量至少包含3个节点
+valid_partitions_cell = integer_partitions(n1, n2, min_group_size);
+if isempty(valid_partitions_cell)
+    error('对于 n1=%d, n2=%d, min_size=%d，不存在有效的整数划分。请检查参数。', n1, n2, min_group_size);
+end
+% 将 Cell 转换为 Matrix 以便高效传递给 C++
+valid_partitions_matrix = vertcat(valid_partitions_cell{:});
+% 【关键】确保每一行都是升序排序的，C++端的剪枝逻辑依赖于此
+valid_partitions_matrix = sort(valid_partitions_matrix, 2);
+fprintf('找到了 %d 种有效的整数划分组合。\n', size(valid_partitions_matrix, 1));
+
+% === 阶段一：预处理，生成初始边 ===
+tic;
+disp('阶段一：正在生成唯一的2-边初始集...');
+local_map = containers.Map('KeyType', 'char', 'ValueType', 'logical');
+first_edges_list = {}; % 使用cell array存储规范化的初始边
+for i = 1:size(pairs,1)
+    edge1 = pairs(i, :);
+    % 找出与 edge1 节点冲突的边
+    invalid_mask = any(ismember(pairs, edge1), 2);
+
+    % 找出交叉冲突的边
+    forbidden_edge1 = sort(mod([edge1(1)-1, edge1(2)+1], n1));
+    forbidden_edge2 = sort(mod([edge1(1)+1, edge1(2)-1], n1));
+
+    remaining_pairs = pairs(~invalid_mask, :);
+    remaining_pairs = remaining_pairs(...
+        ~ismember(remaining_pairs, forbidden_edge1, 'rows') & ...
+        ~ismember(remaining_pairs, forbidden_edge2, 'rows'), :);
+
+    if size(remaining_pairs, 1) < daxiao - 1
+        continue;
+    end
+
+    for j = 1:size(remaining_pairs, 1)
+        edge2 = remaining_pairs(j, :);
+        initial_set = [edge1; edge2];
+
+        % 进行规范化处理
+        candidate_edges = build_mex('pingfan', initial_set, n1);
+        key_str = build_mex('hash', candidate_edges);
+
+        if ~isKey(local_map, key_str)
+            local_map(key_str) = true;
+            first_edges_list{end+1} = candidate_edges;
+        end
+    end
+end
+% 将cell array转换为矩阵，用于并行任务分发
+first_edges = vertcat(first_edges_list{:});
+fprintf('阶段一完成，生成了 %d 个唯一的2-边初始集。\n', size(first_edges, 1) / 2);
+toc;
+
+%% === 阶段二：优化的动态并行计算 ===
+tic;
+disp('正在启动优化的并行池...');
+if ~isempty(gcp('nocreate'))
+    delete(gcp('nocreate'));
+end
+p = parpool();
+fprintf('正在将常量数据预加载到 %d 个 worker 中...\n', p.NumWorkers);
+% 使用 parallel.pool.Constant 将不变的数据广播到所有worker，避免重复传输
+const_pairs = parallel.pool.Constant(pairs);
+const_valid_partitions = parallel.pool.Constant(valid_partitions_matrix);
+fprintf('数据预加载完成。\n');
+INITIAL_SET_SIZE = 2; % 每个任务的初始边集大小
+total_tasks = size(first_edges, 1) / INITIAL_SET_SIZE;
+fprintf('总共 %d 个独立任务将被动态分配。\n', total_tasks);
+F(total_tasks) = parallel.FevalFuture;
+results_all = cell(1, total_tasks);
+fprintf('开始异步提交 %d 个独立任务...\n', total_tasks);
+for k = 1:total_tasks
+    start_idx = (k - 1) * INITIAL_SET_SIZE + 1;
+    end_idx = k * INITIAL_SET_SIZE;
+    e_task = first_edges(start_idx:end_idx, :);
+
+    % 使用 parfeval 异步执行任务
+    F(k) = parfeval(p, @processSingleTask, 1, ...
+                    e_task, const_pairs, n1, n2, daxiao, ...
+                    const_valid_partitions);
+end
+fprintf('所有任务已提交，进入监控和结果收集阶段。\n');
+
+% === 监控与结果收集 (已按要求修改) ===
+completed_count = 0;
+progress_timer = tic; % 初始化一个专门用于进度报告的计时器
+fprintf('监控开始，将每隔约20秒更新一次进度。\n');
+
+for k = 1:total_tasks
+    try
+        % fetchNext会等待下一个完成的任务
+        [completed_idx, task_result] = fetchNext(F);
+        results_all{completed_idx} = task_result;
+        completed_count = completed_count + 1;
+
+        % 【修改】每隔20秒输出一次进度
+        if toc(progress_timer) >= 20
+            fprintf('进度: %d / %d 个任务已完成。\n', completed_count, total_tasks);
+            progress_timer = tic; % 重置计时器
+        end
+    catch ME
+        fprintf('一个任务在执行时发生错误: %s\n', ME.message);
+    end
+end
+
+% 循环结束后，再打印一次最终进度，确保100%时也被显示
+fprintf('所有任务处理完毕！最终进度: %d / %d。\n', completed_count, total_tasks);
+toc;
+
+%% === 阶段三：主进程合并 + 全局去重 ===
+disp('阶段三：正在合并结果并进行全局去重...');
+% 过滤掉可能出现的错误或空结果
+successful_results_indices = cellfun(@(c) iscell(c) && ~isempty(c), results_all);
+results_all_filtered = results_all(successful_results_indices);
+if isempty(results_all_filtered)
+    all_results = {};
+else
+    all_results = vertcat(results_all_filtered{:});
+end
+fprintf('并行阶段共生成 %d 个有效候选解（含重复）\n', length(all_results));
+
+global_map = containers.Map('KeyType','char','ValueType','logical');
+unique_results = {};
+if ~isempty(all_results)
+    for i = 1:length(all_results)
+        edges = all_results{i};
+        canonical_edges = build_mex('pingfan', edges, n1);
+        key_str = build_mex('hash', canonical_edges);
+
+        if ~isKey(global_map, key_str)
+            global_map(key_str) = true;
+            unique_results{end+1} = canonical_edges;
+        end
+    end
+end
+fprintf('去重后剩余 %d 个唯一结构\n', length(unique_results));
+fprintf('脚本执行完毕。\n');
+
+% =========================================================================
+%           【优化】Worker 并行任务函数 (无修改)
+% =========================================================================
+function taskResult = processSingleTask(e_task, const_pairs, n1, n2, daxiao, const_valid_partitions)
+    % 从并行常量对象中获取数据
+    pairs_local = const_pairs.Value;
+    valid_partitions_local = const_valid_partitions.Value;
+
+    try
+        % 将初始边集和所有候选划分一次性传递给C++
+        taskResult = build_mex('build', ...
+            e_task, ...
+            pairs_local, ...
+            n1, n2, daxiao,  ...
+            valid_partitions_local);
+    catch ME
+        fprintf('Worker error for task starting with hash %s: %s\n', ...
+                build_mex('hash', e_task), ME.message);
+        taskResult = {};
+    end
+end
+
+% =========================================================================
+%                         整数划分辅助函数 (无修改)
+% =========================================================================
+function p = integer_partitions(n, k, min_val)
+    if nargin < 3, min_val = 1; end
+    if k == 0
+        if n == 0, p = {[]}; else, p = {}; end
+        return;
+    end
+    if n < k * min_val
+        p = {};
+        return;
+    end
+    p = {};
+    for i = min_val : floor(n / k)
+        sub_partitions = integer_partitions(n - i, k - 1, i);
+        for j = 1:length(sub_partitions)
+            p{end+1} = [i, sub_partitions{j}];
+        end
+    end
+end
