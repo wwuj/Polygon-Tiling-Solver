@@ -1,0 +1,334 @@
+clc;
+clear all;
+
+%% 1. 编译 C++ MEX 文件
+% 检测系统环境并添加 OpenMP 编译指令
+fprintf('正在编译 C++ MEX 文件 (search_algorithm.cpp)...\n');
+try
+    if ispc
+        % Windows (MSVC)
+        mex -R2018a search_algorithm.cpp COMPFLAGS="$COMPFLAGS /O2 /openmp"
+    else
+        % Linux / Mac (GCC/Clang)
+        mex -R2018a search_algorithm.cpp CXXFLAGS="$CXXFLAGS -O3 -fopenmp" LDFLAGS="$LDFLAGS -fopenmp"
+    end
+    fprintf('编译成功！\n\n');
+catch ME
+    fprintf('错误: 编译失败。\n请确保已安装支持 C++ 的编译器。\n运行 mex -setup C++ 进行配置。\n');
+    rethrow(ME);
+end
+
+%% 2. 参数与数据生成
+n1 = 7;        
+K = 3;  
+n2 = n1 - K;  % 增加 n2
+daxiao = n1;
+vmax = 3*K + 3 - n1;
+
+% 生成 FirstE (严格从0开始)
+first = [zeros(n1,1), (n1:2*n1-1)'];
+firstE = zeros(2*n1, 3);
+for i = 1:n1
+    row = first(i, :);
+    firstE(2*i-1, :) = [row, 0];
+    firstE(2*i,   :) = [row, 1];
+end
+
+% 生成 Combinations1
+sets = 1:2*n1-1; 
+pairs = nchoosek(sets, 2);
+diffs = abs(pairs(:,2) - pairs(:,1));
+result = [];
+for j1 = 1:size(pairs, 1)
+    a = pairs(j1, 1);
+    b = pairs(j1, 2);
+    if diffs(j1) == 1
+        result = [result; a, b, 1];
+    else
+        result = [result; a, b, 0; a, b, 1];
+    end
+end
+% 排除特定边
+result = setdiff(result, [n1, 2*n1-1, 0], "rows");
+% 补充边
+combinations1 = [result; [n1-1, n1, 0]];
+
+% 关键：Combinations1 必须排序
+combinations1 = sortrows(combinations1, 1);
+
+%% 3. 调用 C++ 并行求解
+fprintf('开始搜索 (n1=%d, n2=%d, daxiao=%d, vmax=%d)...\n', n1, n2, daxiao, vmax);
+tic;
+
+% 修改：增加输入参数 n2
+% 输入: n1, K, daxiao, vmax, firstE, combinations1, n2
+solutions = search_algorithm(n1, K, daxiao, vmax, firstE, combinations1, n2);
+
+time_elapsed = toc;
+num_solutions = size(solutions, 3);
+
+fprintf('搜索完成。\n');
+fprintf('耗时: %.4f 秒\n', time_elapsed);
+fprintf('找到的不等价解数量: %d\n', num_solutions);
+
+%% 4. 结果查看示例
+if num_solutions > 0
+    fprintf('\n展示第一个解矩阵 A:\n');
+    disp(solutions(:, :, 1));
+else
+    fprintf('\n未找到满足条件的解。\n');
+end
+
+ %有些角度为0,筛查
+youjie={};
+wujie=[];
+zhongzhi=[];
+for i1=1:length(solutions)
+    C=pathfei(solutions(:,:,i1),n1);
+    AVC=AVCjie(C,n1);%增加了新的剪枝条件，有的没有正数解
+if AVC~=1&&AVC~=-2
+    printf('检查AVCjie格式！');
+    zhongzhi=[zhongzhi,i1];
+end
+    if AVC==-2%||check_subset_inclusion(C,n1)
+        wujie=[wujie,i1];
+    else
+        youjie{end+1}=solutions(:,:,i1);
+    end
+end
+
+%不同边个数判断
+for k1=1:n1
+edge={}; 
+for i=1:length(youjie)
+   if length(get_edge_classes(youjie{i}(:,1:2),n1))==k1
+       edge{end+1}=youjie{i};
+   end
+end
+length(edge)
+end
+
+function feidingxiang=pathfei(A,n)%算非定向顶点个数
+convertFunc = @(x) (x < n).*x +(x ==n).*0+ (x >n&x<n+n).*x + (x ==n+n).*n;
+row1=A(:,3)==1;
+B=A(row1,1:2);
+row2=A(:,3)==0;
+C=A(row2,1:2);
+D=convertFunc(B+1);
+C1=C;
+C2=C;
+C1(:,2)=convertFunc(C(:,2)+1);
+C2(:,1)=convertFunc(C(:,1)+1);
+pairs=[B;D;C1;C2];
+graph = containers.Map('KeyType', 'double', 'ValueType', 'any');
+
+% 填充图的邻接关系
+for i = 1:size(pairs, 1)
+    x = pairs(i, 1);
+    y = pairs(i, 2);
+    
+    % 为 x 创建一个邻接列表（如果不存在）
+    if ~isKey(graph, x)
+        graph(x) = [];
+    end
+    % 为 y 创建一个邻接列表（如果不存在）
+    if ~isKey(graph, y)
+        graph(y) = [];
+    end
+    
+    % 添加连接（无向图，x <-> y）
+    graph(x) = [graph(x), y];
+    graph(y) = [graph(y), x];
+end
+
+% 存储所有的追逐链
+feidingxiang = {};
+visited = containers.Map('KeyType', 'double', 'ValueType', 'logical');  % 记录每个节点是否被访问过
+
+% 遍历图生成所有追逐链
+for node = keys(graph)
+    node = cell2mat(node);  % 转换键为数字
+    if ~isKey(visited, node) || ~visited(node)
+        % 如果节点未访问过，开始新的追逐链
+        path = [];
+        current_node = node;
+        
+        % 遍历追逐链
+        while true
+            % 将当前节点添加到路径中
+            path = [path, current_node];
+            visited(current_node) = true;  % 标记为已访问
+            
+            % 获取当前节点的邻接节点
+            neighbors = graph(current_node);
+            
+            % 找到下一个可以追逐的节点
+            next_node = [];
+            for i = 1:length(neighbors)
+                if ~isKey(visited, neighbors(i)) || ~visited(neighbors(i))
+                    next_node = neighbors(i);
+                    break;
+                end
+            end
+            
+            if isempty(next_node)
+                % 如果没有更多的可追逐节点，则停止
+                break;
+            else
+                % 更新当前节点为下一个节点
+                current_node = next_node;
+            end
+        end
+        
+        % 将路径保存到结果中
+        feidingxiang{end+1} = path;
+    end
+end
+end
+
+function exitflag=AVCjie(C,n1)%判断AVC是否存在一个正数解
+   C_mod=cellfun(@(v) mod(v, n1), C, 'UniformOutput', false);
+   num_eq = length(C_mod); % 方程数量 (行数)
+num_vars = n1;          % 变量数量 (x0 到 x6，共7个变量)
+target_sum = 2;
+% 初始化稀疏矩阵 A (也可以用 zeros)
+A = zeros(num_eq, num_vars);
+b = ones(num_eq, 1) * target_sum; % 右边都是 2
+
+for i = 1:num_eq
+    indices = C_mod{i};
+    % 注意：题目中是 x0, x1... (0-based)，但 MATLAB 矩阵索引从 1 开始
+    % 所以 x0 对应矩阵的第 1 列，x1 对应第 2 列，以此类推。
+    col_indices = indices + 1; 
+    
+    % 填充矩阵 A
+    % 如果一个方程中同一个变量出现多次（比如 mod 后有两个 0），系数会累加
+    for k = col_indices
+        A(i, k) = A(i, k) + 1;
+    end
+end
+
+% ---------------------------------------------------------
+% 步骤 3: 判断是否存在正数解 (x > 0)
+% ---------------------------------------------------------
+% 这是一个线性规划的可行性问题。
+% 我们寻找 x 使得 Ax = b 且 x > 0。
+% 标准求解器 linprog 处理的是 Ax = b, x >= lb。
+% 为了表示"正数"(严格大于0)，我们将下界 lb 设为一个极小的正数 (例如 1e-6)。
+
+lb = ones(num_vars, 1) * 1e-6; % 下界：x >= 0.000001
+ub = [];                       % 上界：无无穷大
+f = zeros(num_vars, 1);        % 目标函数：我们只关心可行性，设为0即可
+
+% 求解线性规划
+options = optimoptions('linprog', 'Display', 'off');
+[x_sol, fval, exitflag] = linprog(f, [], [], A, b, lb, ub, options);
+
+
+function [is_invalid, error_msg] = check_subset_inclusion(Cycle_Cells, n1)
+% CHECK_SUBSET_INCLUSION (MOD N1 版本)
+% 1. 将所有顶点对 n1 取模。
+% 2. 检查是否存在 Cycle A 的变量集合 包含 Cycle B 的变量集合。
+%    如果包含，且有剩余（真子集），则剩余部分之和必须为0，导致矛盾。
+
+    num_cycles = length(Cycle_Cells);
+    % 【修改点1】变量数现在只有 n1 个，不再是 2*n1
+    num_vars = n1; 
+    
+    % 1. 构建计数矩阵 M (行=循环，列=模n1后的顶点出现次数)
+    M = zeros(num_cycles, num_vars);
+    for i = 1:num_cycles
+        raw_data = Cycle_Cells{i};
+        
+        % 【修改点2】先对 n1 取模，结果为 0 ~ n1-1
+        data_mod = mod(raw_data, n1);
+        
+        % 转为 1-based索引用于累加 (1 ~ n1)
+        idx = data_mod + 1;
+        
+        % 统计每个 mod 后顶点的出现次数
+        M(i, :) = accumarray(idx(:), 1, [num_vars, 1])';
+    end
+    
+    is_invalid = false;
+    error_msg = '';
+
+    % 2. 暴力两两比较
+    for i = 1:num_cycles       % "大"循环候选
+        for j = 1:num_cycles   % "小"循环候选
+            if i == j, continue; end 
+            
+            % 计算差值向量
+            diff_vec = M(i, :) - M(j, :);
+            
+            % 判断逻辑：
+            % 1. diff_vec >= 0: i 包含了 j 所有的变量
+            % 2. any(diff_vec > 0): i 比 j 多出了至少一个变量 (真子集)
+            if all(diff_vec >= 0) && any(diff_vec > 0)
+                is_invalid = true;
+                error_msg = sprintf('发现矛盾(Mod %d): Cycle %d 包含了 Cycle %d。', n1, i, j);
+                return;
+            end
+        end
+    end
+end
+
+function edge_chains = get_edge_classes(A, n1)
+% GET_EDGE_CLASSES 计算矩阵A mod n1 后的连通情况
+% 输入:
+%   A: 粘合矩阵
+%   n1: 模数
+% 输出:
+%   edge_chains: Cell数组，每组包含串联起来的边索引(0 到 n1-1)
+
+    % 1. 对矩阵取模
+    A_mod = mod(A, n1);
+    
+    % 2. 初始化并查集
+    % 范围是 0 到 n1-1，共 n1 个元素
+    parent = 1:n1; 
+    
+    % --- 内部函数: 查找根节点 ---
+    function p = find_set(x)
+        path = [];
+        while parent(x) ~= x
+            path(end+1) = x;
+            x = parent(x);
+        end
+        for node = path, parent(node) = x; end
+        p = x;
+    end
+
+    % --- 内部函数: 合并集合 ---
+    function union_set(x, y)
+        rootX = find_set(x);
+        rootY = find_set(y);
+        if rootX ~= rootY
+            parent(rootY) = rootX; % 合并
+        end
+    end
+
+    % 3. 遍历每一行进行串联
+    for i = 1:size(A_mod, 1)
+        u = A_mod(i, 1);
+        v = A_mod(i, 2);
+        
+        % 转为 1-based 索引进行操作
+        union_set(u + 1, v + 1);
+    end
+    
+    % 4. 整理结果 (Grouping)
+    % 计算最终的根节点状态
+    final_roots = arrayfun(@(x) find_set(x), 1:n1);
+    unique_roots = unique(final_roots);
+    
+    % 仅输出包含元素的集合（理论上所有 0~n1-1 都在某个集合中）
+    edge_chains = {};
+    for k = 1:length(unique_roots)
+        r = unique_roots(k);
+        % 找出属于该组的所有边，转回 0-based
+        members = find(final_roots == r) - 1;
+        % 排序以便查看
+        edge_chains{end+1} = sort(members);
+    end
+end
