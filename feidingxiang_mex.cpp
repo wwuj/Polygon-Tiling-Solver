@@ -23,7 +23,7 @@ struct Edge {
         if (v != other.v) return v < other.v;
         return type < other.type;
     }
-    
+
     bool operator==(const Edge& other) const {
         return u == other.u && v == other.v && type == other.type;
     }
@@ -38,7 +38,7 @@ struct EdgeHash {
         std::size_t h1 = std::hash<int>()(e.u);
         std::size_t h2 = std::hash<int>()(e.v);
         std::size_t h3 = std::hash<int>()(e.type);
-        return h1 ^ (h2 << 1) ^ (h3 << 2); 
+        return h1 ^ (h2 << 1) ^ (h3 << 2);
     }
 };
 
@@ -109,12 +109,12 @@ std::string hash_edges_internal(const EdgeList& edges) {
 // 【修改】pingfanyiout：只变换 u,v，type 跟随
 EdgeList pingfanyiout_internal(const EdgeList& edges, int n1) {
     if (edges.empty()) return {};
-    
+
     // 内部 lambda：确保 u < v，type 不变
     auto normalize_edge = [](Edge e) {
         if (e.u > e.v) std::swap(e.u, e.v);
         return e;
-    };
+        };
 
     EdgeList best_edges = edges;
     for (auto& edge : best_edges) {
@@ -244,7 +244,6 @@ void recursive_build(
     }
 
     // === 剪枝：当前分区状态 ===
-    bool should_prune = false;
     std::vector<int> current_partition_sizes;
     for (int k = 0; k < n1; ++k) {
         if (dsu.parent[k] == k) {
@@ -255,32 +254,19 @@ void recursive_build(
     std::vector<int> target_partition_desc = target_partition_asc;
     std::sort(target_partition_desc.begin(), target_partition_desc.end(), std::greater<int>());
 
-    if (!current_partition_sizes.empty()) {
-        if (current_partition_sizes[0] > target_partition_desc[0]) {
-            should_prune = true;
-        }
-        if (!should_prune) {
-            if (current_partition_sizes[0] == target_partition_desc[0]) {
-                for (size_t k = 1; k < current_partition_sizes.size(); ++k) {
-                    if (k < target_partition_desc.size() && current_partition_sizes[k] > target_partition_desc[k]) {
-                        should_prune = true;
-                        break;
-                    }
-                }
-            }
-            else {
-                if (current_partition_sizes.size() > 1 && target_partition_desc.size() > 1) {
-                    if (current_partition_sizes[1] > target_partition_desc[1]) {
-                        if (current_partition_sizes[0] + current_partition_sizes[1] > target_partition_desc[0]) {
-                            should_prune = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (should_prune) {
+    // Current components can merge; their sorted ranks are not fixed.
+    // Any j current components occupy at most j final components.
+    if (current_partition_sizes.size() < target_partition_desc.size()) {
         return;
+    }
+    int current_prefix = 0;
+    int target_prefix = 0;
+    for (size_t k = 0; k < target_partition_desc.size(); ++k) {
+        current_prefix += current_partition_sizes[k];
+        target_prefix += target_partition_desc[k];
+        if (current_prefix > target_prefix) {
+            return;
+        }
     }
 
     // === 搜索循环 ===
@@ -292,18 +278,18 @@ void recursive_build(
 
         // 约束：顺序 (只比较 u)
         if (!current_edges.empty()) {
-            if (u < current_edges.back().u) continue; 
-            if (u == current_edges.back().u && v <= current_edges.back().v) continue; 
+            if (u < current_edges.back().u) continue;
+            if (u == current_edges.back().u && v <= current_edges.back().v) continue;
             // 这里严格控制顺序以避免重复
         }
 
         // Look-ahead 剪枝 (基于 u 的节点可用性)
         int edges_still_needed = daxiao - static_cast<int>(current_edges.size()) - 1;
         if (edges_still_needed > 0) {
-             int potential = 0;
-             // 简单估算剩余节点能提供的边的上限
-             int nodes_left = n1 - 1 - u;
-             if (nodes_left / 2 < edges_still_needed) return; 
+            int potential = 0;
+            // 简单估算剩余节点能提供的边的上限
+            int nodes_left = n1 - 1 - u;
+            if (nodes_left / 2 < edges_still_needed) return;
         }
 
         if (used_nodes[u] || used_nodes[v] || forbidden_pairs.count(e)) {
@@ -322,7 +308,8 @@ void recursive_build(
             // 注意：DSU操作的是节点索引
             dsu.unite(u, v);
             dsu.unite((u + 1) % n1, (v + 1) % n1);
-        } else {
+        }
+        else {
             // Type 0: 衍生图 mod([u+1,v,0]) 和 mod([u,v+1,0])
             // 意味着连接节点 u+1 和 v，以及 u 和 v+1
             dsu.unite(u, (v + 1) % n1);
@@ -341,7 +328,8 @@ void recursive_build(
             int u_p1 = (u + 1) % n1;
             int v_m1 = (v - 1 + n1) % n1;
             f2 = { std::min(u_p1, v_m1), std::max(u_p1, v_m1), 0 };
-        } else { // type == 1
+        }
+        else { // type == 1
             // mod([u-1, v-1, 1])
             int u_m1 = (u - 1 + n1) % n1;
             int v_m1 = (v - 1 + n1) % n1;
@@ -397,7 +385,7 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
 
     if (strcmp(command, "build") == 0) {
         if (nrhs != 7) mexErrMsgIdAndTxt("MyToolbox:build", "Args: cmd, init, all_pairs, n1, n2, daxiao, parts");
-        
+
         EdgeList initial_edges = mxArrayToEdgeList(prhs[1]);
         EdgeList all_pairs = mxArrayToEdgeList(prhs[2]);
         int n1 = static_cast<int>(mxGetScalar(prhs[3]));
@@ -414,7 +402,7 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
         for (const auto& edge : initial_edges) {
             used_nodes[edge.u] = 1;
             used_nodes[edge.v] = 1;
-            int u = edge.u; 
+            int u = edge.u;
             int v = edge.v;
             int type = edge.type;
 
@@ -422,7 +410,8 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
             if (type == 1) {
                 dsu.unite(u, v);
                 dsu.unite((u + 1) % n1, (v + 1) % n1);
-            } else {
+            }
+            else {
                 dsu.unite(u, (v + 1) % n1);
                 dsu.unite((u + 1) % n1, v);
             }
@@ -433,7 +422,8 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
                 int u_p1 = (u + 1) % n1; int v_m1 = (v - 1 + n1) % n1;
                 forbidden_pairs.insert({ std::min(u_m1, v_p1), std::max(u_m1, v_p1), 0 });
                 forbidden_pairs.insert({ std::min(u_p1, v_m1), std::max(u_p1, v_m1), 0 });
-            } else {
+            }
+            else {
                 int u_m1 = (u - 1 + n1) % n1; int v_m1 = (v - 1 + n1) % n1;
                 int u_p1 = (u + 1) % n1; int v_p1 = (v + 1) % n1;
                 forbidden_pairs.insert({ std::min(u_m1, v_m1), std::max(u_m1, v_m1), 1 });
