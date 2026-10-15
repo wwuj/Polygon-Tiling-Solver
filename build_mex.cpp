@@ -1,5 +1,5 @@
 // =========================================================================
-//                  ÎÄ¼ş: build_mex.cpp (ÍêÕûÇÒÒÑĞŞÕı)
+//                  æ–‡ä»¶: build_mex.cpp (å®Œæ•´ä¸”å·²ä¿®æ­£)
 // =========================================================================
 #include "mex.h"
 #include <vector>
@@ -9,23 +9,23 @@
 #include <string>
 #include <sstream>
 #include <string.h>
-#include <functional> // ÓÃÓÚ std::greater
+#include <functional> // ç”¨äº std::greater
 
-// ¶¨ÒåÍ¼Ïà¹ØµÄ»ù±¾ÀàĞÍ
+// å®šä¹‰å›¾ç›¸å…³çš„åŸºæœ¬ç±»å‹
 using Edge = std::pair<int, int>;
 using EdgeList = std::vector<Edge>;
-// ÓÃÓÚÔÚ unordered_set ÖĞ´æ´¢ Edge
+// ç”¨äºåœ¨ unordered_set ä¸­å­˜å‚¨ Edge
 struct EdgeHash {
     std::size_t operator()(const Edge& e) const {
         return std::hash<int>()(e.first) ^ (std::hash<int>()(e.second) << 1);
     }
 };
-// ¶¨Òå¸ß¼¶ÀàĞÍ
+// å®šä¹‰é«˜çº§ç±»å‹
 using ResultSet = std::vector<EdgeList>;
 using ForbiddenSet = std::unordered_set<Edge, EdgeHash>;
 
 // ===================================================================
-// ²¢²é¼¯ (DSU) Êı¾İ½á¹¹ (´ø³·Ïú¹¦ÄÜ)
+// å¹¶æŸ¥é›† (DSU) æ•°æ®ç»“æ„ (å¸¦æ’¤é”€åŠŸèƒ½)
 // ===================================================================
 struct DSU {
     std::vector<int> parent;
@@ -73,7 +73,7 @@ struct DSU {
 };
 
 // ===================================================================
-// ºËĞÄ¸¨Öúº¯Êı
+// æ ¸å¿ƒè¾…åŠ©å‡½æ•°
 // ===================================================================
 std::string hash_edges_internal(const EdgeList& edges) {
     std::stringstream ss;
@@ -122,7 +122,7 @@ EdgeList pingfanyiout_internal(const EdgeList& edges, int n1) {
 }
 
 // ===================================================================
-// ¸¨Öúº¯Êı (MATLAB <-> C++)
+// è¾…åŠ©å‡½æ•° (MATLAB <-> C++)
 // ===================================================================
 static EdgeList mxArrayToEdgeList(const mxArray* arr) {
     double* data = mxGetPr(arr);
@@ -165,7 +165,7 @@ static std::vector<std::vector<int>> mxArrayToVectorOfVectors(const mxArray* arr
 }
 
 // ===================================================================
-// ºËĞÄËã·¨: recursive_build (ÍêÕûÓÅ»¯°æ)
+// æ ¸å¿ƒç®—æ³•: recursive_build (å®Œæ•´ä¼˜åŒ–ç‰ˆ)
 // ===================================================================
 void recursive_build(
     EdgeList& current_edges, const EdgeList& candidate_pairs, size_t start_index,
@@ -173,12 +173,12 @@ void recursive_build(
     std::vector<char>& used_nodes, ForbiddenSet& forbidden_pairs, DSU& dsu,
     const std::vector<int>& target_partition_asc
 ) {
-    // ¼ôÖ¦ 1: »ù´¡ÊıÁ¿¼ôÖ¦
+    // å‰ªæ 1: åŸºç¡€æ•°é‡å‰ªæ
     if (current_edges.size() + (candidate_pairs.size() - start_index) < daxiao) {
         return;
     }
 
-    // ÖÕÖ¹Ìõ¼ş
+    // ç»ˆæ­¢æ¡ä»¶
     if (current_edges.size() == daxiao) {
         std::vector<int> final_partition_sizes;
         for (int i = 0; i < n1; ++i) {
@@ -195,8 +195,7 @@ void recursive_build(
         return;
     }
 
-    // ¼ôÖ¦ 2: »ùÓÚµ±Ç°»®·Ö×´Ì¬µÄ¼ôÖ¦
-    bool should_prune = false;
+    // å‰ªæ 2: åŸºäºå½“å‰åˆ’åˆ†çŠ¶æ€çš„å‰ªæ
     std::vector<int> current_partition_sizes;
     for (int k = 0; k < n1; ++k) {
         if (dsu.parent[k] == k) {
@@ -207,52 +206,40 @@ void recursive_build(
     std::vector<int> target_partition_desc = target_partition_asc;
     std::sort(target_partition_desc.begin(), target_partition_desc.end(), std::greater<int>());
 
-    if (!current_partition_sizes.empty()) {
-        if (current_partition_sizes[0] > target_partition_desc[0]) {
-            should_prune = true;
-        }
-        if (!should_prune) {
-            if (current_partition_sizes[0] == target_partition_desc[0]) {
-                for (size_t k = 1; k < current_partition_sizes.size(); ++k) {
-                    if (k < target_partition_desc.size() && current_partition_sizes[k] > target_partition_desc[k]) {
-                        should_prune = true;
-                        break;
-                    }
-                }
-            }
-            else {
-                if (current_partition_sizes.size() > 1 && target_partition_desc.size() > 1) {
-                    if (current_partition_sizes[1] > target_partition_desc[1]) {
-                        if (current_partition_sizes[0] + current_partition_sizes[1] > target_partition_desc[0]) {
-                            should_prune = true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if (should_prune) {
+    // Every current component belongs wholly to a final component.
+    // The j largest current components occupy at most j final components,
+    // so their total cannot exceed the j largest final capacities.
+    if (current_partition_sizes.size() < target_partition_desc.size()) {
         return;
     }
+    int current_prefix = 0;
+    int target_prefix = 0;
+    for (size_t k = 0; k < target_partition_desc.size(); ++k) {
+        current_prefix += current_partition_sizes[k];
+        target_prefix += target_partition_desc[k];
+        if (current_prefix > target_prefix) {
+            return;
+        }
+    }
 
-    // --- Éî¶ÈÓÅÏÈËÑË÷Ö÷Ñ­»· ---
+    // --- æ·±åº¦ä¼˜å…ˆæœç´¢ä¸»å¾ªç¯ ---
     for (size_t i = start_index; i < candidate_pairs.size(); ++i) {
         const auto& e = candidate_pairs[i];
         int u = e.first;
         int v = e.second;
 
-        // Ô¼ÊøÌõ¼ş: ĞÂ±ßµÄµÚÒ»¸ö¶¥µã u ±ØĞëÑÏ¸ñ´óÓÚÉÏÒ»Ìõ±ßµÄµÚÒ»¸ö¶¥µã¡£
+        // çº¦æŸæ¡ä»¶: æ–°è¾¹çš„ç¬¬ä¸€ä¸ªé¡¶ç‚¹ u å¿…é¡»ä¸¥æ ¼å¤§äºä¸Šä¸€æ¡è¾¹çš„ç¬¬ä¸€ä¸ªé¡¶ç‚¹ã€‚
         if (!current_edges.empty()) {
             if (u <= current_edges.back().first) {
                 continue;
             }
         }
 
-        // ¼ôÖ¦ 3: ¾«È·µÄÇ°Õ°¼ôÖ¦ (Look-ahead Pruning)
+        // å‰ªæ 3: ç²¾ç¡®çš„å‰ç»å‰ªæ (Look-ahead Pruning)
         int edges_still_needed = daxiao - static_cast<int>(current_edges.size()) - 1;
         if (edges_still_needed > 0) {
             int potential_nodes_count = (n1 - 1) - u;
-            int used_nodes_count_in_pool = 1; // ¼ÆÈëµ±Ç°µÄ v
+            int used_nodes_count_in_pool = 1; // è®¡å…¥å½“å‰çš„ v
             for (const auto& prev_edge : current_edges) {
                 if (prev_edge.second > u) {
                     used_nodes_count_in_pool++;
@@ -269,7 +256,7 @@ void recursive_build(
             continue;
         }
 
-        // --- ×ö³öÑ¡Ôñ ---
+        // --- åšå‡ºé€‰æ‹© ---
         current_edges.push_back(e);
         used_nodes[u] = 1;
         used_nodes[v] = 1;
@@ -282,11 +269,11 @@ void recursive_build(
         forbidden_pairs.insert(f1);
         forbidden_pairs.insert(f2);
 
-        // --- ½øÈëÏÂÒ»²ãµİ¹é ---
+        // --- è¿›å…¥ä¸‹ä¸€å±‚é€’å½’ ---
         recursive_build(current_edges, candidate_pairs, i + 1, results, n1, n2, daxiao,
             used_nodes, forbidden_pairs, dsu, target_partition_asc);
 
-        // --- »ØËİ (³·ÏúÑ¡Ôñ) ---
+        // --- å›æº¯ (æ’¤é”€é€‰æ‹©) ---
         forbidden_pairs.erase(f1);
         forbidden_pairs.erase(f2);
         dsu.undo();
@@ -298,7 +285,7 @@ void recursive_build(
 }
 
 // ===================================================================
-// ¡¾ÖØÒª¡¿¶¥²ãËÑË÷º¯Êı (±ØĞëÔÚ mexFunction Ö®Ç°¶¨Òå)
+// ã€é‡è¦ã€‘é¡¶å±‚æœç´¢å‡½æ•° (å¿…é¡»åœ¨ mexFunction ä¹‹å‰å®šä¹‰)
 // ===================================================================
 void search_all_partitions(
     const EdgeList& initial_edges, const EdgeList& candidate_pairs,
@@ -314,7 +301,7 @@ void search_all_partitions(
 }
 
 // ===================================================================
-// MEX Íø¹Øº¯Êı
+// MEX ç½‘å…³å‡½æ•°
 // ===================================================================
 void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
     if (nrhs < 1) {
@@ -351,7 +338,7 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
         }
         dsu.history.clear();
 
-        // ÏÖÔÚµ÷ÓÃ search_all_partitions ÊÇ°²È«µÄ£¬ÒòÎªËüÒÑ¾­ÔÚÉÏÃæ±»¶¨ÒåÁË
+        // ç°åœ¨è°ƒç”¨ search_all_partitions æ˜¯å®‰å…¨çš„ï¼Œå› ä¸ºå®ƒå·²ç»åœ¨ä¸Šé¢è¢«å®šä¹‰äº†
         search_all_partitions(initial_edges, all_pairs, results_cpp, n1, n2, daxiao,
             used_nodes, forbidden_pairs, dsu, all_target_partitions);
 
