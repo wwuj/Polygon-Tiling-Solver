@@ -1,6 +1,7 @@
 clc;%n1边形，亏格为g的定向曲面
 clear all;
 close all;
+mex -O build_mex.cpp;
 
 % === 参数设置 ===
 n1 = 8;
