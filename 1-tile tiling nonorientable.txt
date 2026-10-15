@@ -1,6 +1,7 @@
 clc;
 clear all;
 close all;
+mex -O feidingxiang_mex.cpp
 
 % clear mex
 % mex feidingxiang_mex.cpp
