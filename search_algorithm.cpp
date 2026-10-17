@@ -1,451 +1,348 @@
 #include "mex.h"
-#include <vector>
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <exception>
+#include <limits>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
+#include <vector>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 
-// ================= 参数结构体 =================
-struct Params {
-    int n1;
-    int K;
-    int daxiao;
-    int vmax;
-    int n2;          // 新增 n2
-    int num_nodes;
-};
-
-// ================= 常量定义 =================
 const int MAX_DAXIAO = 32;
-const int MAX_NODES = 64;
+const int MAX_NODES = 2 * MAX_DAXIAO;
 
-// ================= 基础结构 =================
-
-struct Row {
-    int u, v, t;
+struct Params {
+    int n1, K, daxiao, vmax, n2, num_nodes, threads;
 };
 
-// 矩阵结构体 (用于存储解和同构去重)
+struct Row { int u, v, t; };
+
 struct Matrix {
     int data[MAX_DAXIAO][3];
     int rows;
-
-    Matrix() : rows(0) {}
-
-    void init(int r) { rows = r; }
-
-    inline void set(int r, int c, int val) {
-        data[r][c] = val;
-    }
-    inline int get(int r, int c) const {
-        return data[r][c];
-    }
-
-    // 比较函数：用于排序和去重
-    bool operator<(const Matrix& other) const {
-        if (rows != other.rows) return rows < other.rows;
-        return std::memcmp(data, other.data, rows * 3 * sizeof(int)) < 0;
-    }
-    bool operator==(const Matrix& other) const {
-        if (rows != other.rows) return false;
-        return std::memcmp(data, other.data, rows * 3 * sizeof(int)) == 0;
-    }
+    Matrix() : rows(0) { std::memset(data, 0, sizeof(data)); }
+    void init(int n) { rows = n; }
+    int get(int r, int c) const { return data[r][c]; }
+    void set(int r, int c, int value) { data[r][c] = value; }
 };
 
-// ================= 核心状态：顶点库/链系统 =================
-// 不使用图论搜索，而是维护顶点串联状态
+// A canonical row needs only 13 bits: (u << 7) | (v << 1) | t.
+// Unused array entries are zero, so hashing/equality are deterministic.
+struct CanonicalKey {
+    std::array<std::uint16_t, MAX_DAXIAO> code;
+    CanonicalKey() { code.fill(0); }
+    bool operator==(const CanonicalKey& b) const { return code == b.code; }
+    bool operator<(const CanonicalKey& b) const { return code < b.code; }
+};
+
+struct CanonicalHash {
+    std::size_t operator()(const CanonicalKey& key) const {
+        std::size_t h = static_cast<std::size_t>(1469598103934665603ULL);
+        for (std::size_t i = 0; i < key.code.size(); ++i) {
+            h ^= static_cast<std::size_t>(key.code[i]);
+            h *= static_cast<std::size_t>(1099511628211ULL);
+        }
+        return h;
+    }
+};
+typedef std::unordered_set<CanonicalKey, CanonicalHash> ResultSet;
+typedef std::array<std::vector<Row>, MAX_NODES> CandidateBuckets;
+
+inline int strict_mod(int x, int n) { int r = x % n; return r < 0 ? r + n : r; }
+inline int get_next_vertex(int x, int n) {
+    return (x / n) * n + ((x % n + 1) % n);
+}
+
 struct PathSystem {
-    // degree[i]: 顶点 i 的当前度数 (0, 1, 2)
-    // 0: 未使用
-    // 1: 链的端点
-    // 2: 链的内部点 (或环上的点)
-    int degree[MAX_NODES];
-
-    // mate[i]: 如果 degree[i] == 1, mate[i] 存储该链另一端的顶点编号
-    // 如果 degree[i] != 1, mate[i] 的值无意义(或不维护)
-    int mate[MAX_NODES];
-
-    // size[i]: 如果 degree[i] == 1, size[i] 存储以 i 为端点的整条链的顶点个数
-    // 新增一条边 [u,v] 时，顶点个数为 2
-    int size[MAX_NODES];
-
-    // 当前形成的闭环个数
+    int degree[MAX_NODES], mate[MAX_NODES], size[MAX_NODES];
+    bool used_edge[MAX_NODES]; // Polygon edges, distinct from corner degrees.
     int closed_loops_count;
-
-    // 当前使用的矩阵
+    int excess; // Sum over components of max(component vertex count - 3, 0).
+    bool has_intra_t1;
+    unsigned cross_t_mask;
     Matrix current_A;
 
-    PathSystem(int daxiao) {
-        current_A.init(daxiao);
+    explicit PathSystem(int n) : closed_loops_count(0), excess(0), has_intra_t1(false), cross_t_mask(0) {
+        current_A.init(n);
         std::memset(degree, 0, sizeof(degree));
         std::memset(mate, 0, sizeof(mate));
         std::memset(size, 0, sizeof(size));
-        closed_loops_count = 0;
+        std::memset(used_edge, 0, sizeof(used_edge));
     }
 
-    // 尝试添加连接 (u, v)
-    // 返回 true 表示成功添加且符合所有约束
-    // 返回 false 表示违反约束（如度数超标、长度超标等）
     bool add_segment(int u, int v, int vmax) {
-        // 1. 基础度数检查：每个点最多连接2条边
-        if (degree[u] >= 2 || degree[v] >= 2) return false;
-        if (u == v) return false; // 不允许自环（长度1，小于最小环长3）
-
-        // Case A: 两个点都是新点 (0 - 0)
-        // 形成新链: [u, v], 顶点数 2
+        if (u == v || degree[u] >= 2 || degree[v] >= 2) return false;
         if (degree[u] == 0 && degree[v] == 0) {
-            degree[u] = 1; mate[u] = v; size[u] = 2;
-            degree[v] = 1; mate[v] = u; size[v] = 2;
+            if (vmax < 2) return false;
+            degree[u] = degree[v] = 1;
+            mate[u] = v; mate[v] = u;
+            size[u] = size[v] = 2;
             return true;
         }
-
-        // Case B: 一个新点，一个端点 (1 - 0)
-        // 延长链条
+        if (degree[u] == 0 && degree[v] == 1) return add_segment(v, u, vmax);
         if (degree[u] == 1 && degree[v] == 0) {
-            int z = mate[u]; // u 所在的链的另一端
-            int new_len = size[u] + 1; // 增加一个顶点 v
-
-            if (new_len > vmax) return false; // 串联起来没有闭环，长度也要 <= vmax
-
-            // 更新状态
-            degree[u] = 2; // u 变为内部
-            degree[v] = 1; // v 成为新端点
-
-            mate[z] = v;
-            mate[v] = z;
-            size[z] = new_len;
-            size[v] = new_len;
+            int z = mate[u], length = size[u] + 1;
+            if (length > vmax) return false;
+            excess += std::max(length - 3, 0) - std::max(size[u] - 3, 0);
+            degree[u] = 2; degree[v] = 1;
+            mate[z] = v; mate[v] = z;
+            size[z] = size[v] = length;
             return true;
         }
-        if (degree[u] == 0 && degree[v] == 1) {
-            return add_segment(v, u, vmax); // 对称处理
-        }
-
-        // Case C: 两个都是端点 (1 - 1)
-        // 合并两条链 或 闭合环
         if (degree[u] == 1 && degree[v] == 1) {
-            int z = mate[u];
-            int w = mate[v];
-
+            int z = mate[u], w = mate[v];
             if (z == v) {
-                // === 形成闭环 ===
-                // u 和 v 是同一条链的两端，连起来就闭合了
-                int loop_len = size[u]; // 闭环的顶点数等于链的顶点数 (因为加入边(u,v)只是闭合，不加新点)
-
-                // 闭环约束：个数 >= 3 且 <= vmax
-                if (loop_len < 3 || loop_len > vmax) return false;
-
-                degree[u] = 2;
-                degree[v] = 2;
-                closed_loops_count++;
-                return true;
+                if (size[u] < 3 || size[u] > vmax) return false;
+                degree[u] = degree[v] = 2;
+                ++closed_loops_count;
             }
             else {
-                // === 合并两条不同的链 ===
-                // 链1: z...u, 链2: v...w
-                // 合并后: z...u-v...w
-                int new_len = size[u] + size[v]; // 顶点数相加
-
-                if (new_len > vmax) return false; // 串联长度约束
-
-                degree[u] = 2;
-                degree[v] = 2;
-
-                mate[z] = w;
-                mate[w] = z;
-                size[z] = new_len;
-                size[w] = new_len;
-                return true;
+                int length = size[u] + size[v];
+                if (length > vmax) return false;
+                excess += (length - 3) - std::max(size[u] - 3, 0) - std::max(size[v] - 3, 0);
+                degree[u] = degree[v] = 2;
+                mate[z] = w; mate[w] = z;
+                size[z] = size[w] = length;
             }
+            return true;
         }
+        return false;
+    }
 
-        return false; // Should not reach here
+    // Failure may modify this copy; callers always discard a failed copy.
+    bool add_row(const Row& row, int row_idx, const Params& p) {
+        if (row.u == row.v || used_edge[row.u] || used_edge[row.v]) return false;
+        used_edge[row.u] = used_edge[row.v] = true;
+        current_A.set(row_idx, 0, row.u);
+        current_A.set(row_idx, 1, row.v);
+        current_A.set(row_idx, 2, row.t);
+        if ((row.u < p.n1) == (row.v < p.n1)) {
+            if (row.t == 1) has_intra_t1 = true;
+        }
+        else {
+            cross_t_mask |= (1U << row.t);
+        }
+        const int un = get_next_vertex(row.u, p.n1);
+        const int vn = get_next_vertex(row.v, p.n1);
+        if (row.t == 1)
+            return add_segment(row.u, row.v, p.vmax) && add_segment(un, vn, p.vmax);
+        return add_segment(un, row.v, p.vmax) && add_segment(row.u, vn, p.vmax);
     }
 };
 
-// ================= 辅助函数 =================
-
-// 严格取模：保证结果非负
-inline int strict_mod(int a, int n) {
-    int res = a % n;
-    return res < 0 ? res + n : res;
-}
-
-// 顶点变换逻辑：
-// 0~n1-1 (内圈): x+1 -> 0 if x=n1-1
-// n1~2n1-1 (外圈): x+1 -> n1 if x=2n1-1
-inline int get_next_vertex(int x, int n1) {
-    if (x < n1) {
-        return (x + 1 == n1) ? 0 : x + 1;
-    }
-    else {
-        return (x + 1 == 2 * n1) ? n1 : x + 1;
-    }
-}
-
-// 矩阵排序与标准化 (用于去重)
-void sort_and_normalize_matrix(Matrix& M, int daxiao) {
-    // 行内排序
-    for (int i = 0; i < daxiao; ++i) {
-        if (M.data[i][0] > M.data[i][1]) {
-            std::swap(M.data[i][0], M.data[i][1]);
-        }
-    }
-    // 矩阵行排序
-    for (int i = 0; i < daxiao - 1; ++i) {
-        for (int j = 0; j < daxiao - i - 1; ++j) {
-            bool swap = false;
-            int* rA = M.data[j];
-            int* rB = M.data[j + 1];
-            if (rA[0] > rB[0]) swap = true;
-            else if (rA[0] == rB[0]) {
-                if (rA[1] > rB[1]) swap = true;
-                else if (rA[1] == rB[1] && rA[2] > rB[2]) swap = true;
-            }
-            if (swap) {
-                int tmp[3]; std::memcpy(tmp, rA, 12);
-                std::memcpy(rA, rB, 12); std::memcpy(rB, tmp, 12);
-            }
-        }
-    }
-}
-
-// 计算同构代表元
-Matrix get_canonical(const Matrix& A, const Params& p) {
-    Matrix sortedA = A;
-    sort_and_normalize_matrix(sortedA, p.daxiao);
-
-    Matrix best;
-    bool init = false;
-
-    // 构建 B (互补矩阵)
-    Matrix B; B.init(p.daxiao);
-    for (int i = 0; i < p.daxiao; ++i) {
-        int m = sortedA.get(i, 0);
-        int n = sortedA.get(i, 1);
-        int t = sortedA.get(i, 2);
-        int m_new = (m < p.n1) ? m + p.n1 : m - p.n1;
-        int n_new = (n < p.n1) ? n + p.n1 : n - p.n1;
-        B.set(i, 0, m_new); B.set(i, 1, n_new); B.set(i, 2, t);
-    }
-    sort_and_normalize_matrix(B, p.daxiao);
-
-    const Matrix* sources[2] = { &sortedA, &B };
-    Matrix T; T.init(p.daxiao);
-
-    for (int s = 0; s < 2; ++s) {
-        const Matrix& M = *sources[s];
-        for (int d = 0; d < p.n1; ++d) {
-            // 平移
-            for (int i = 0; i < p.daxiao; ++i) {
-                int c[2] = { M.get(i,0), M.get(i,1) };
-                int nc[2];
-                for (int k = 0; k < 2; ++k) {
-                    if (c[k] < p.n1) nc[k] = strict_mod(c[k] + d, p.n1);
-                    else nc[k] = p.n1 + strict_mod(c[k] - p.n1 + d, p.n1);
+// Exactly the synchronous D_n action and optional exchange of the two blocks.
+// The same reflection acts on BOTH blocks; t is unchanged. Group order: 4*n.
+CanonicalKey get_canonical(const Matrix& a, const Params& p) {
+    CanonicalKey best;
+    bool initialized = false;
+    for (int swap_blocks = 0; swap_blocks < 2; ++swap_blocks) {
+        for (int reflect = 0; reflect < 2; ++reflect) {
+            for (int d = 0; d < p.n1; ++d) {
+                std::uint16_t by_u[MAX_NODES] = {};
+                for (int r = 0; r < p.daxiao; ++r) {
+                    int x[2] = { a.get(r, 0), a.get(r, 1) };
+                    for (int c = 0; c < 2; ++c) {
+                        const int block = (x[c] / p.n1) ^ swap_blocks;
+                        const int local = x[c] % p.n1;
+                        x[c] = block * p.n1 + strict_mod(d + (reflect ? -local : local), p.n1);
+                    }
+                    if (x[0] > x[1]) std::swap(x[0], x[1]);
+                    by_u[x[0]] = static_cast<std::uint16_t>((x[0] << 7) | (x[1] << 1) | a.get(r, 2));
                 }
-                T.set(i, 0, nc[0]); T.set(i, 1, nc[1]); T.set(i, 2, M.get(i, 2));
+                CanonicalKey candidate;
+                int count = 0;
+                // A perfect matching uses each edge once, hence distinct first columns.
+                for (int u = 0; u < p.num_nodes; ++u)
+                    if (by_u[u] != 0) candidate.code[count++] = by_u[u];
+                if (!initialized || candidate < best) { best = candidate; initialized = true; }
             }
-            sort_and_normalize_matrix(T, p.daxiao);
-            if (!init || T < best) { best = T; init = true; }
-
-            // 反射
-            for (int i = 0; i < p.daxiao; ++i) {
-                int c[2] = { M.get(i,0), M.get(i,1) };
-                int nc[2];
-                for (int k = 0; k < 2; ++k) {
-                    if (c[k] < p.n1) nc[k] = strict_mod(d - c[k], p.n1);
-                    else nc[k] = p.n1 + strict_mod(d - (c[k] - p.n1), p.n1);
-                }
-                T.set(i, 0, nc[0]); T.set(i, 1, nc[1]); T.set(i, 2, M.get(i, 2));
-            }
-            sort_and_normalize_matrix(T, p.daxiao);
-            if (T < best) best = T;
         }
     }
     return best;
 }
 
-// ================= 搜索逻辑 =================
-
-// 使用按值传递 State (PathSystem) 来简化回溯
-// 因为 State 较小 (~1KB)，且深度有限，直接拷贝比复杂的回溯逻辑更安全且高效
-void dfs(PathSystem state, int row_idx, const std::vector<Row>& combinations,
-    std::vector<Matrix>& local_results, const Params& p) {
-
-    // 终局判断
-    if (row_idx == p.daxiao) {
-        // 增加条件：最后达到 daxiao 时，闭环个数必须等于 n2
-        if (state.closed_loops_count == p.n2) {
-            // 这里还可以加上 t 的求和校验等原始逻辑
-            int sum_t = 0;
-            bool has_intra = false;
-            for (int i = 0; i < p.daxiao; ++i) {
-                sum_t += state.current_A.get(i, 2);
-                int u = state.current_A.get(i, 0);
-                int v = state.current_A.get(i, 1);
-                if ((u < p.n1) == (v < p.n1)) has_intra = true;
-            }
-
-            bool valid = true;
-            if (sum_t == 0) valid = false;
-            else if (sum_t == p.daxiao && !has_intra) valid = false;
-
-            if (valid) {
-                local_results.push_back(get_canonical(state.current_A, p));
-            }
+void dfs(const PathSystem& state, int row_idx, const CandidateBuckets& buckets,
+    ResultSet& results, std::atomic<bool>& abort_search, const Params& p) {
+    if (abort_search.load(std::memory_order_relaxed)) return;
+    if (state.closed_loops_count > p.n2) return;
+    // Component excess cannot decrease under extension, joining or closure.
+    // At a valid leaf its value is 2*n - 3*(n-K) = 3*K-n.
+    if (state.excess > 3 * p.K - p.n1) return;
+    const int remaining = p.daxiao - row_idx;
+    // One new segment can close at most one cycle; each row adds two segments.
+    if (state.closed_loops_count + 2 * remaining < p.n2) return;
+    if (remaining == 0) {
+        if (state.closed_loops_count != p.n2) return;
+        // Seed guarantees connectedness. Orientation is inconsistent exactly when
+        // an intra-block t=1 occurs or cross-block rows contain both t values.
+        if (!state.has_intra_t1 && state.cross_t_mask != 3U) return;
+        for (int e = 0; e < p.num_nodes; ++e)
+            if (!state.used_edge[e] || state.degree[e] != 2) return;
+        CanonicalKey key = get_canonical(state.current_A, p);
+        // Deduplicate immediately: never retain the full list of raw discoveries.
+        std::exception_ptr insertion_error;
+#pragma omp critical(two_tile_results)
+        {
+            // OpenMP requires exceptions to be caught inside this structured block.
+            try { results.insert(key); }
+            catch (...) { insertion_error = std::current_exception(); }
         }
+        if (insertion_error) std::rethrow_exception(insertion_error);
         return;
     }
 
-    // 剪枝：当前闭环数已经超过 n2，直接返回
-    if (state.closed_loops_count > p.n2) return;
-
-    // 剪枝：剩余行数不足以凑齐 n2 个闭环 (估算：每个闭环至少3条边，粗略估计)
-    // 这里的剪枝比较难精确，保持基础的闭环数不超过即可
-
-    int last_u = state.current_A.get(row_idx - 1, 0);
-    int remaining_rows = p.daxiao - row_idx;
-
-    for (const auto& cand : combinations) {
-        // 顺序约束：第一列必须非降序
-        if (cand.u <= last_u) continue;
-
-        // 简单的剩余行数剪枝
-        if ((p.num_nodes - 1 - cand.u) < 2 * remaining_rows - 1) break;
-
-        // 顶点已经被度数占满的快速检查 (degree < 2)
-        // 注意：cand.u 和 cand.v 是矩阵中的数，不是所有涉及的顶点
-        // 需要根据 t 具体判断涉及哪些顶点
-
-        // 拷贝当前状态准备尝试
+    int u = 0;
+    while (u < p.num_nodes && state.used_edge[u]) ++u;
+    if (u == p.num_nodes) return;
+    // Every completion must pair this smallest unused edge with a larger unused
+    // edge. Branching only on bucket[u] is complete and gives one row order.
+    for (std::size_t i = 0; i < buckets[u].size(); ++i) {
+        const Row& candidate = buckets[u][i];
+        if (state.used_edge[candidate.v]) continue;
         PathSystem next_state = state;
-
-        // 记录矩阵行
-        next_state.current_A.set(row_idx, 0, cand.u);
-        next_state.current_A.set(row_idx, 1, cand.v);
-        next_state.current_A.set(row_idx, 2, cand.t);
-
-        // 解析需要添加的两条线段
-        int u1, v1, u2, v2;
-        if (cand.t == 1) {
-            // 串联 [m, n] 和 [m+1, n+1]
-            u1 = cand.u;
-            v1 = cand.v;
-            u2 = get_next_vertex(cand.u, p.n1);
-            v2 = get_next_vertex(cand.v, p.n1);
-        }
-        else { // t == 0
-            // 串联 [m+1, n] 和 [m, n+1]
-            u1 = get_next_vertex(cand.u, p.n1);
-            v1 = cand.v;
-            u2 = cand.u;
-            v2 = get_next_vertex(cand.v, p.n1);
-        }
-
-        // 尝试添加第一条线段
-        if (next_state.add_segment(u1, v1, p.vmax)) {
-            // 尝试添加第二条线段
-            if (next_state.add_segment(u2, v2, p.vmax)) {
-                // 两条都成功添加，进入下一层
-                dfs(next_state, row_idx + 1, combinations, local_results, p);
-            }
-        }
-        // 如果失败，next_state 被丢弃，循环继续
+        if (next_state.add_row(candidate, row_idx, p))
+            dfs(next_state, row_idx + 1, buckets, results, abort_search, p);
     }
 }
 
-// ================= MEX 入口 =================
+int read_integer(const mxArray* value, int low, int high, const char* name) {
+    if (!mxIsDouble(value) || mxIsComplex(value) || mxIsSparse(value) ||
+        mxGetNumberOfElements(value) != 1)
+        throw std::invalid_argument(std::string(name) + " must be a full real double scalar.");
+    const double x = mxGetScalar(value);
+    if (!std::isfinite(x) || x != std::floor(x) || x < low || x > high)
+        throw std::invalid_argument(std::string(name) + " must be an integer in [" +
+            std::to_string(low) + ", " + std::to_string(high) + "].");
+    return static_cast<int>(x);
+}
+
+std::vector<Row> read_rows(const mxArray* value, const Params& p, bool seed) {
+    const char* name = seed ? "firstE" : "combinations1";
+    if (!mxIsDouble(value) || mxIsComplex(value) || mxIsSparse(value) ||
+        mxGetNumberOfDimensions(value) != 2 || mxGetN(value) != 3)
+        throw std::invalid_argument(std::string(name) + " must be a full real double M-by-3 matrix.");
+    const mwSize count = mxGetM(value);
+    // This also keeps the OpenMP loop index within signed-int range.
+    if (count > static_cast<mwSize>(std::numeric_limits<int>::max()))
+        throw std::invalid_argument(std::string(name) + " has too many rows.");
+    const double* data = mxGetPr(value);
+    std::vector<Row> rows;
+    rows.reserve(count);
+    for (mwSize i = 0; i < count; ++i) {
+        const double u = data[i], v = data[i + count], t = data[i + 2 * count];
+        if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(t) ||
+            u != std::floor(u) || v != std::floor(v) || (t != 0 && t != 1) ||
+            u < 0 || v >= p.num_nodes || u >= v)
+            throw std::invalid_argument(std::string(name) + " rows require integer 0 <= u < v < 2*n and t in {0,1}.");
+        if (seed && (u != 0 || v < p.n1))
+            throw std::invalid_argument("Each firstE row must pair edge 0 with an edge of the other block.");
+        if (!seed && u == 0)
+            throw std::invalid_argument("combinations1 must exclude edge 0, which is already used by the seed.");
+        rows.push_back(Row{ static_cast<int>(u), static_cast<int>(v), static_cast<int>(t) });
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        return a.u != b.u ? a.u < b.u : (a.v != b.v ? a.v < b.v : a.t < b.t);
+        });
+    rows.erase(std::unique(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        return a.u == b.u && a.v == b.v && a.t == b.t;
+        }), rows.end());
+    return rows;
+}
+
+mxArray* solve(int nrhs, const mxArray* prhs[]) {
+    if (nrhs != 7 && nrhs != 8)
+        throw std::invalid_argument("Expected 7 inputs: n, K, daxiao, vmax, firstE, combinations1, n2; optional 8th input: Threads.");
+    Params p;
+    p.n1 = read_integer(prhs[0], 3, MAX_DAXIAO, "n");
+    p.K = read_integer(prhs[1], 1, p.n1 - 1, "K");
+    p.daxiao = read_integer(prhs[2], p.n1, p.n1, "daxiao");
+    p.vmax = read_integer(prhs[3], 3 * p.K + 3 - p.n1, 3 * p.K + 3 - p.n1, "vmax");
+    p.n2 = read_integer(prhs[6], p.n1 - p.K, p.n1 - p.K, "n2");
+    p.num_nodes = 2 * p.n1;
+    p.threads = 1;
+#ifdef _OPENMP
+    const int default_threads = std::max(1, static_cast<int>(0.4 * omp_get_num_procs() + 0.5));
+    p.threads = std::max(1, std::min(omp_get_max_threads(), default_threads));
+#endif
+    if (nrhs == 8) p.threads = read_integer(prhs[7], 1, 1024, "Threads");
+    std::vector<Row> seeds = read_rows(prhs[4], p, true);
+    std::vector<Row> combinations = read_rows(prhs[5], p, false);
+    CandidateBuckets buckets;
+    for (std::size_t i = 0; i < combinations.size(); ++i)
+        buckets[combinations[i].u].push_back(combinations[i]);
+    p.threads = std::max(1, std::min(p.threads, static_cast<int>(seeds.size())));
+    ResultSet results;
+    std::atomic<bool> abort_search(false);
+    std::exception_ptr worker_error;
+    const bool feasible = p.vmax >= 3 && 3 * p.n2 <= p.num_nodes;
+    if (feasible) {
+        const int seed_count = static_cast<int>(seeds.size());
+#pragma omp parallel for schedule(dynamic, 1) num_threads(p.threads)
+        for (int i = 0; i < seed_count; ++i) {
+            if (abort_search.load(std::memory_order_relaxed)) continue;
+            try {
+                PathSystem state(p.daxiao);
+                if (state.add_row(seeds[i], 0, p))
+                    dfs(state, 1, buckets, results, abort_search, p);
+            }
+            catch (...) {
+                abort_search.store(true, std::memory_order_relaxed);
+#pragma omp critical(two_tile_error)
+                { if (!worker_error) worker_error = std::current_exception(); }
+            }
+        }
+    }
+    if (worker_error) std::rethrow_exception(worker_error);
+
+    // Only pointers are sorted; the compact canonical keys are not duplicated.
+    std::vector<const CanonicalKey*> ordered;
+    ordered.reserve(results.size());
+    for (ResultSet::const_iterator it = results.begin(); it != results.end(); ++it)
+        ordered.push_back(&*it);
+    std::sort(ordered.begin(), ordered.end(), [](const CanonicalKey* a, const CanonicalKey* b) {
+        return *a < *b;
+        });
+    const mwSize count = static_cast<mwSize>(ordered.size());
+    const mwSize per_solution = static_cast<mwSize>(3 * p.daxiao);
+    if (count > std::numeric_limits<mwSize>::max() / per_solution / sizeof(double))
+        throw std::length_error("Output array size overflows the addressable size.");
+    const mwSize dims[3] = { static_cast<mwSize>(p.daxiao), 3, count };
+    mxArray* output = mxCreateNumericArray(3, dims, mxDOUBLE_CLASS, mxREAL);
+    if (!output) throw std::bad_alloc();
+    double* data = mxGetPr(output);
+    for (mwSize k = 0; k < count; ++k) {
+        for (int r = 0; r < p.daxiao; ++r) {
+            const unsigned code = ordered[k]->code[r];
+            data[k * per_solution + r] = static_cast<double>(code >> 7);
+            data[k * per_solution + p.daxiao + r] = static_cast<double>((code >> 1) & 63U);
+            data[k * per_solution + 2 * p.daxiao + r] = static_cast<double>(code & 1U);
+        }
+    }
+    return output;
+}
 
 void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
-    // 增加 n2，参数变为 7 个
-    if (nrhs != 7) mexErrMsgTxt("Expected 7 inputs: n1, K, daxiao, vmax, firstE, combinations1, n2");
-
-    Params p;
-    p.n1 = (int)mxGetScalar(prhs[0]);
-    p.K = (int)mxGetScalar(prhs[1]);
-    p.daxiao = (int)mxGetScalar(prhs[2]);
-    p.vmax = (int)mxGetScalar(prhs[3]);
-    p.num_nodes = 2 * p.n1;
-    // 读取 n2
-    p.n2 = (int)mxGetScalar(prhs[6]);
-
-    double* fE_ptr = mxGetPr(prhs[4]);
-    size_t fE_rows = mxGetM(prhs[4]);
-    std::vector<Row> firstE(fE_rows);
-    for (size_t i = 0; i < fE_rows; ++i) {
-        firstE[i].u = (int)fE_ptr[i + 0 * fE_rows];
-        firstE[i].v = (int)fE_ptr[i + 1 * fE_rows];
-        firstE[i].t = (int)fE_ptr[i + 2 * fE_rows];
+    try {
+        if (nlhs > 1) throw std::invalid_argument("At most one output is supported.");
+        mxArray* output = solve(nrhs, prhs);
+        if (nlhs == 0) mxDestroyArray(output);
+        else plhs[0] = output;
     }
-
-    double* c1_ptr = mxGetPr(prhs[5]);
-    size_t c1_rows = mxGetM(prhs[5]);
-    std::vector<Row> combinations1(c1_rows);
-    for (size_t i = 0; i < c1_rows; ++i) {
-        combinations1[i].u = (int)c1_ptr[i + 0 * c1_rows];
-        combinations1[i].v = (int)c1_ptr[i + 1 * c1_rows];
-        combinations1[i].t = (int)c1_ptr[i + 2 * c1_rows];
+    catch (const std::bad_alloc&) {
+        mexErrMsgTxt("Insufficient memory for the distinct solutions and MATLAB output array.");
     }
-
-    std::vector<Matrix> global_results;
-
-#pragma omp parallel
-    {
-        std::vector<Matrix> local_results;
-
-#pragma omp for schedule(dynamic)
-        for (int i = 0; i < (int)fE_rows; ++i) {
-            PathSystem s(p.daxiao);
-
-            // 初始化第一行
-            Row r0 = firstE[i];
-            s.current_A.set(0, 0, r0.u);
-            s.current_A.set(0, 1, r0.v);
-            s.current_A.set(0, 2, r0.t);
-
-            // 处理第一行的两条线段
-            int u1, v1, u2, v2;
-            if (r0.t == 1) {
-                u1 = r0.u; v1 = r0.v;
-                u2 = get_next_vertex(r0.u, p.n1); v2 = get_next_vertex(r0.v, p.n1);
-            }
-            else {
-                u1 = get_next_vertex(r0.u, p.n1); v1 = r0.v;
-                u2 = r0.u; v2 = get_next_vertex(r0.v, p.n1);
-            }
-
-            // 对于第一行，理论上总是合法的（初始），但还是检查一下
-            if (s.add_segment(u1, v1, p.vmax) && s.add_segment(u2, v2, p.vmax)) {
-                dfs(s, 1, combinations1, local_results, p);
-            }
-        }
-
-#pragma omp critical
-        {
-            global_results.insert(global_results.end(), local_results.begin(), local_results.end());
-        }
+    catch (const std::exception& error) {
+        mexErrMsgTxt(error.what());
     }
-
-    // 去重
-    if (!global_results.empty()) {
-        std::sort(global_results.begin(), global_results.end());
-        auto last = std::unique(global_results.begin(), global_results.end());
-        global_results.erase(last, global_results.end());
-    }
-
-    // 输出
-    int count = global_results.size();
-    const mwSize dims[3] = { (mwSize)p.daxiao, 3, (mwSize)count };
-    plhs[0] = mxCreateNumericArray(3, dims, mxDOUBLE_CLASS, mxREAL);
-    double* out_ptr = mxGetPr(plhs[0]);
-
-    int k = 0;
-    for (const auto& mat : global_results) {
-        for (int c = 0; c < 3; ++c) {
-            for (int r = 0; r < p.daxiao; ++r) {
-                out_ptr[r + c * p.daxiao + k * p.daxiao * 3] = (double)mat.get(r, c);
-            }
-        }
-        k++;
+    catch (...) {
+        mexErrMsgTxt("Unexpected C++ exception during enumeration.");
     }
 }
